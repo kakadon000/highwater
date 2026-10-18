@@ -60,11 +60,9 @@ body {
 }
 
 .brand-icon {
-  width: 26px;
-  height: 26px;
-  border-radius: 7px;
-  border: 1px solid rgba(76, 194, 255, 0.45);
-  background: #0d1117;
+  width: 27px;
+  height: 27px;
+  filter: drop-shadow(0 1px 4px rgba(30, 123, 232, 0.45));
 }
 
 .nav-links { display: flex; gap: 26px; margin-left: auto; }
@@ -358,11 +356,9 @@ body {
 }
 
 .footer-icon {
-  width: 34px;
-  height: 34px;
-  border-radius: 9px;
-  border: 1px solid rgba(76, 194, 255, 0.45);
-  background: #0d1117;
+  width: 44px;
+  height: 44px;
+  filter: drop-shadow(0 2px 8px rgba(30, 123, 232, 0.35));
   margin-bottom: 14px;
 }
 
