@@ -165,7 +165,7 @@ pub fn set_no_activate(window: &Window) {
     // SAFETY: a style write on a window this process owns; GetWindowLongPtrW
     // reads the very style the next call rewrites, so the other bits survive.
     unsafe {
-        let exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exStyle | WS_EX_NOACTIVATE.0 as isize);
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_NOACTIVATE.0 as isize);
     }
 }
