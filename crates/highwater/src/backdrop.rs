@@ -28,6 +28,8 @@ use windows::Win32::Graphics::Dwm::{
     DWM_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
     DwmSetWindowAttribute,
 };
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::core::{s, w};
 
 use crate::AppWindow;
 
@@ -71,7 +73,9 @@ fn attach_to_window(window: &Window) {
 
 /// The Windows 10 route: the accent policy draws the same blur behind the window.
 /// The API is undocumented; its shape has been stable since 2015 and is what every
-/// acrylic application on Windows 10 drives.
+/// acrylic application on Windows 10 drives. Windows ships the export in user32.dll
+/// but not in user32.lib, so it is resolved by name at runtime — which is also why
+/// the static link cannot be the way in.
 ///
 /// # Safety
 /// A user32 call on a window this process owns, with pointers to stack data the call
@@ -94,10 +98,8 @@ unsafe fn acrylic_behind(hwnd: HWND) {
         size: usize,
     }
 
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn SetWindowCompositionAttribute(hwnd: HWND, data: *const CompositionAttributeData) -> i32;
-    }
+    type SetCompositionAttribute =
+        unsafe extern "system" fn(HWND, *const CompositionAttributeData) -> i32;
 
     let policy = AccentPolicy {
         accent_state: ACCENT_ENABLE_ACRYLICBLURBEHIND,
@@ -110,10 +112,29 @@ unsafe fn acrylic_behind(hwnd: HWND) {
         data: &policy as *const AccentPolicy as *mut c_void,
         size: size_of::<AccentPolicy>(),
     };
+    // SAFETY: user32 is loaded in every GUI process and never unloaded here.
+    let module = unsafe { GetModuleHandleW(w!("user32.dll")) };
+    let Ok(module) = module else {
+        tracing::debug!("user32 is not loaded, which a GUI process does not do; stopping");
+        return;
+    };
+    // SAFETY: a plain export lookup by name.
+    let address = unsafe { GetProcAddress(module, s!("SetWindowCompositionAttribute")) };
+    let Some(address) = address else {
+        tracing::debug!("this user32 has no composition attribute export; staying opaque");
+        return;
+    };
+    // SAFETY: the address came from GetProcAddress on user32, and the signature is the
+    // one the export has shipped with since Windows 10 1507.
+    let set = unsafe {
+        core::mem::transmute::<unsafe extern "system" fn() -> isize, SetCompositionAttribute>(
+            address,
+        )
+    };
     // SAFETY: see the function contract. A zero return means no blur: the sheet's own
     // translucency then lands on the plain window, which is the pre-2016 look and
     // readable all the same.
-    if unsafe { SetWindowCompositionAttribute(hwnd, &data) } == 0 {
+    if unsafe { set(hwnd, &data) } == 0 {
         tracing::debug!("the Windows 10 accent route refused the acrylic; staying opaque");
     }
 }

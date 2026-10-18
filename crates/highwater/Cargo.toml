@@ -45,6 +45,8 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Registry",
     # SECURITY_ATTRIBUTES on the mutex signature.
     "Win32_Security",
+    # The runtime resolution of the Windows 10 acrylic export (user32.lib omits it).
+    "Win32_System_LibraryLoader",
     # The kill-on-close job that ties a client-spawned daemon to this process.
     "Win32_System_JobObjects",
     "Win32_System_Threading",
