@@ -427,8 +427,8 @@ impl WidgetPanel {
 
     /// A desktop widget is not an application to the taskbar: it has no taskbar
     /// entry and no alt-tab stop, like every gadget that ever sat on a desktop.
-    /// It takes no focus either: toggling it must never yank the keyboard out
-    /// of whatever the user was typing, the way a gadget never does.
+    /// On Windows it never takes the focus either, so toggling it never yanks
+    /// the keyboard out of whatever the user was typing.
     fn skip_taskbar(&self) {
         let Some(ui) = self.ui.upgrade() else {
             return;
@@ -438,9 +438,8 @@ impl WidgetPanel {
             use slint::winit_030::winit::platform::windows::WindowExtWindows;
             ui.window()
                 .with_winit_window(|window| window.set_skip_taskbar(true));
-            ui.window().with_winit_window(|window| {
-                window.set_focusable(false);
-            });
+            ui.window()
+                .with_winit_window(crate::backdrop::set_no_activate);
         }
         let _ = &ui;
     }

@@ -29,6 +29,9 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GWL_EXSTYLE, GetWindowLongPtrW, SetWindowLongPtrW, WS_EX_NOACTIVATE,
+};
 use windows::core::{s, w};
 
 use crate::AppWindow;
@@ -147,5 +150,22 @@ fn hwnd(window: &Window) -> Option<HWND> {
     match handle.as_raw() {
         RawWindowHandle::Win32(handle) => Some(HWND(handle.hwnd.get() as *mut c_void)),
         _ => None,
+    }
+}
+
+/// A desktop gadget never takes the focus: clicking the widget must not yank
+/// the keyboard out of whatever the user was typing. winit offers no focusable
+/// switch on an existing window, so this sets the style such a gadget wears —
+/// `WS_EX_NOACTIVATE` — straight onto the Win32 window. Idempotent: the style
+/// bit is set again, not toggled.
+pub fn set_no_activate(window: &Window) {
+    let Some(hwnd) = hwnd(window) else {
+        return;
+    };
+    // SAFETY: a style write on a window this process owns; GetWindowLongPtrW
+    // reads the very style the next call rewrites, so the other bits survive.
+    unsafe {
+        let exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exStyle | WS_EX_NOACTIVATE.0 as isize);
     }
 }
