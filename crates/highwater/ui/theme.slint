@@ -8,6 +8,10 @@ export global Theme {
     in-out property <color> accent: #3584e4;
 
     out property <color> window-bg: dark ? #222226 : #fafafb;
+    // The preferences sheet over the Windows acrylic backdrop (see src/backdrop.rs): the
+    // same colours, thinned so the system's blur glows through. Light keeps more of
+    // itself, since white needs the extra opacity to stay readable over a busy desktop.
+    out property <color> window-bg-acrylic: dark ? #222226b3 : #fafafbd9;
     out property <color> header-bg: dark ? #2e2e32 : #ffffff;
     out property <color> header-shade: dark ? #0000065c : #0000061f;
     out property <color> card-bg: dark ? #343437 : #ffffff;

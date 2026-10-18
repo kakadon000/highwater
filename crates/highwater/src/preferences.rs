@@ -147,6 +147,10 @@ impl PreferencesDialog {
         prefs.set_page(0);
         dialog.render();
         prefs.set_open(true);
+        // The acrylic sits behind the sheet; it must be armed while the window it
+        // belongs to exists, and opening preferences is the first moment that is sure.
+        #[cfg(windows)]
+        crate::backdrop::attach(ui);
         dialog
     }
 

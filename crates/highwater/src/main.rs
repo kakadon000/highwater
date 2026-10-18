@@ -9,6 +9,8 @@ mod about;
 mod alert;
 #[cfg(unix)]
 mod application;
+#[cfg(windows)]
+mod backdrop;
 mod bus;
 mod chart;
 #[cfg(windows)]
@@ -183,6 +185,11 @@ fn main() -> Result<(), slint::PlatformError> {
     // its curve. An opaque surface has none of its own to show.
     #[cfg(windows)]
     ui.set_corner_radius(if composited { 8.0 } else { 0.0 });
+    // Only the composited surface keeps its alpha, which is what lets the preferences
+    // sheet go translucent over the system's acrylic (see `backdrop`). Any other path
+    // keeps the sheet's solid colour.
+    #[cfg(windows)]
+    slint::ComponentHandle::global::<Prefs>(&ui).set_acrylic(composited);
     #[cfg(windows)]
     maintenance::watch_stop().map_err(|error| slint::PlatformError::from(error.to_string()))?;
     frame::install(&ui);

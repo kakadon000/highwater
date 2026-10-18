@@ -10,6 +10,9 @@ import { ActionRow, BoxedList, Button, ComboRow, EntryRow, GroupHeading, SpinRow
 export global Prefs {
     in-out property <bool> open;
     in-out property <int> page;
+    // Windows 10/11: the sheet goes translucent over the system's acrylic backdrop
+    // (main.rs sets this only when the window's surface keeps its alpha).
+    in property <bool> acrylic;
 
     in-out property <bool> minimize-on-close;
     // A choice is its index, -1 for a value this build does not know; the matching
@@ -436,7 +439,7 @@ export component PreferencesDialog inherits Scrim {
             y: (root.height - self.height) / 2 + root.rise;
             width: min(620px, root.width - 24px);
             height: min(680px, root.height - 24px);
-            background: Theme.window-bg;
+            background: Prefs.acrylic ? Theme.window-bg-acrylic : Theme.window-bg;
             border-radius: 14px;
             drop-shadow-blur: 24px;
             drop-shadow-offset-y: 4px;

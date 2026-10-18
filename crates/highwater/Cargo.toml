@@ -39,6 +39,8 @@ zbus = { version = "5.13.2", features = ["p2p"] }
 slint = { version = "~1.18.1", features = ["renderer-femtovg-wgpu", "unstable-wgpu-30"] }
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
+    # The system acrylic backdrop behind the preferences sheet (DwmSetWindowAttribute).
+    "Win32_Graphics_Dwm",
     # The desktop's light/dark choice and accent colour.
     "Win32_System_Registry",
     # SECURITY_ATTRIBUTES on the mutex signature.
