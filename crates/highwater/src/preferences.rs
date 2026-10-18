@@ -162,6 +162,7 @@ impl PreferencesDialog {
                 .position(|scale| *scale == dialog.widget.scale())
                 .unwrap_or(1) as i32,
         );
+        prefs.set_widget_look_choice(dialog.widget.look_choice() as i32);
         prefs.set_open(true);
         // The acrylic sits behind the sheet; it must be armed while the window it
         // belongs to exists, and opening preferences is the first moment that is sure.
@@ -235,6 +236,14 @@ impl PreferencesDialog {
             move |index| {
                 if let Some(scale) = crate::widget::SCALES.get(index.clamp(0, 2) as usize) {
                     widget.set_scale(*scale);
+                }
+            }
+        });
+        prefs.on_widget_look_changed({
+            let widget = Rc::clone(&self.widget);
+            move |index| {
+                if let Some(look) = crate::widget::LOOKS.get(index.clamp(0, 2) as usize) {
+                    widget.set_look(look);
                 }
             }
         });

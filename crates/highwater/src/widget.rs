@@ -38,6 +38,10 @@ struct WidgetConfig {
     /// The card's size, as a percentage: one of [`SCALES`].
     #[serde(default = "default_scale")]
     scale: i32,
+    /// The card's look: "auto" follows the desktop, "light" and "dark" hold
+    /// still. Anything unreadable is auto.
+    #[serde(default = "default_look")]
+    look: String,
     /// The last physical position the card was dragged to, `[x, y]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     position: Option<[i32; 2]>,
@@ -59,6 +63,24 @@ fn default_scale() -> i32 {
     100
 }
 
+/// The widget look choices, as the preferences sheet offers them.
+pub const LOOKS: [&str; 3] = ["auto", "light", "dark"];
+
+fn default_look() -> String {
+    "auto".to_owned()
+}
+
+impl WidgetConfig {
+    /// The look as it was written, folded into one of [`LOOKS`].
+    fn look(&self) -> &'static str {
+        LOOKS
+            .iter()
+            .find(|choice| **choice == self.look)
+            .copied()
+            .unwrap_or("auto")
+    }
+}
+
 impl Default for WidgetConfig {
     fn default() -> Self {
         Self {
@@ -66,6 +88,7 @@ impl Default for WidgetConfig {
             on_top: default_on_top(),
             opacity: default_opacity(),
             scale: default_scale(),
+            look: default_look(),
             position: None,
         }
     }
@@ -109,6 +132,8 @@ pub struct WidgetPanel {
     config: RefCell<WidgetConfig>,
     /// The position as it was last written, so a quiet card writes nothing.
     saved_at: Cell<Option<(i32, i32)>>,
+    /// The desktop's own dark choice, which "auto" follows.
+    desktop_dark: Cell<bool>,
     events: EventListeners,
     /// Debounces a header drag: the system reports no drag's end, only moves,
     /// and a settings file is not written sixty times a second.
@@ -135,12 +160,17 @@ impl WidgetPanel {
             rows: Rc::new(VecModel::default()),
             config: RefCell::new(Self::load()),
             saved_at: Cell::default(),
+            desktop_dark: Cell::new(false),
             events: RefCell::default(),
             save_timer: slint::Timer::default(),
         });
 
         let desk = ui.global::<WidgetDesk>();
         desk.set_acrylic(translucent);
+        // The card's corners, shadow and clear gutter exist only where the
+        // surface can carry them; an opaque surface gets a square, solid card
+        // that fills its window edge to edge.
+        desk.set_translucent(translucent);
         desk.set_opacity(panel.config.borrow().opacity);
         desk.set_scale(panel.config.borrow().scale as f32 / 100.0);
         desk.set_rows(slint::ModelRc::from(Rc::clone(&panel.rows)));
@@ -182,12 +212,58 @@ impl WidgetPanel {
         self.rows.set_vec(rows);
     }
 
-    /// Copies the desktop's dark choice onto this window's own palette.
+    /// Copies the desktop's dark choice onto this window's own palette, as the
+    /// card's look resolves it: "auto" follows the desktop, "light" and "dark"
+    /// hold still.
     pub fn set_appearance(&self, dark: bool) {
+        self.desktop_dark.set(dark);
+        self.apply_look();
+    }
+
+    /// Puts the card on the look its setting asks for. A fresh Slint instance
+    /// starts light, so the first tick after a dark launch lands here too.
+    fn apply_look(&self) {
         let Some(ui) = self.ui.upgrade() else {
             return;
         };
+        let dark = match self.config.borrow().look() {
+            "light" => false,
+            "dark" => true,
+            _ => self.desktop_dark.get(),
+        };
         ui.global::<Theme>().set_dark(dark);
+    }
+
+    pub fn look(&self) -> &'static str {
+        self.config.borrow().look()
+    }
+
+    /// Sets the card's look — the preferences sheet's Auto / Light / Dark. An
+    /// unknown word is auto, the same way an unreadable settings file is.
+    pub fn set_look(&self, look: &str) {
+        let look = LOOKS
+            .iter()
+            .find(|choice| **choice == look)
+            .copied()
+            .unwrap_or("auto");
+        {
+            let mut config = self.config.borrow_mut();
+            if config.look() == look {
+                return;
+            }
+            config.look = look.to_owned();
+        }
+        self.persist();
+        self.apply_look();
+    }
+
+    /// The look as the preferences sheet's menu should name it: an index into
+    /// [`LOOKS`].
+    pub fn look_choice(&self) -> usize {
+        LOOKS
+            .iter()
+            .position(|choice| *choice == self.look())
+            .unwrap_or_default()
     }
 
     /// Copies the desktop's accent onto this window's own palette.
@@ -361,7 +437,7 @@ impl WidgetPanel {
 
     /// Shows the window and puts it where it was last dragged — or at a
     /// desktop corner the first time. It takes no focus: it is a gadget.
-    fn show(&self) {
+    fn show(self: &Rc<Self>) {
         let Some(ui) = self.ui.upgrade() else {
             return;
         };
@@ -371,6 +447,16 @@ impl WidgetPanel {
         }
         self.arm_backdrop();
         self.place();
+        // The monitor a window belongs to is not always known the moment it is
+        // shown; once the event loop has turned the wheel, place it again. A
+        // card that landed on the primary monitor in between moves quietly.
+        let weak = Rc::downgrade(self);
+        slint::Timer::single_shot(std::time::Duration::from_millis(60), move || {
+            if let Some(panel) = weak.upgrade() {
+                panel.apply_on_top();
+                panel.place();
+            }
+        });
     }
 
     /// Puts the card where the settings file says, clamped into the monitor it
@@ -516,7 +602,16 @@ mod tests {
         assert!(config.on_top);
         assert_eq!(config.opacity, 85);
         assert_eq!(config.scale, 100);
+        assert_eq!(config.look(), "auto");
         assert_eq!(config.position, None);
+    }
+
+    #[test]
+    fn an_unreadable_look_is_auto() {
+        let config: WidgetConfig = serde_json::from_str(r#"{"look": "sepia"}"#).unwrap();
+        assert_eq!(config.look(), "auto");
+        let config: WidgetConfig = serde_json::from_str(r#"{"look": "dark"}"#).unwrap();
+        assert_eq!(config.look(), "dark");
     }
 
     #[test]

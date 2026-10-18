@@ -53,6 +53,8 @@ export global Prefs {
     in-out property <int> widget-opacity;
     // The size as a menu index: 0 compact, 1 default, 2 large.
     in-out property <int> widget-scale-choice;
+    // The look as a menu index: 0 auto, 1 light, 2 dark.
+    in-out property <int> widget-look-choice;
 
     // A row waiting for the daemon's answer, which is what bounds how fast it can send.
     in property <bool> busy-minimize;
@@ -91,6 +93,7 @@ export global Prefs {
     callback widget-top-changed(bool);
     callback widget-opacity-changed(int);
     callback widget-scale-changed(int);
+    callback widget-look-changed(int);
     callback widget-reset-position();
 
     public function show-toast(message: string) {
@@ -251,6 +254,18 @@ component GeneralPage inherits Page {
                 chosen(index) => {
                     Prefs.widget-scale-choice = index;
                     Prefs.widget-scale-changed(index);
+                }
+            }
+            ComboRow {
+                title: "Look";
+                subtitle: "Auto follows your system's light or dark mode.";
+                first: false;
+                choices: ["Auto", "Light", "Dark"];
+                selected: Prefs.widget-look-choice;
+                enabled: Prefs.widget-enabled;
+                chosen(index) => {
+                    Prefs.widget-look-choice = index;
+                    Prefs.widget-look-changed(index);
                 }
             }
             ActionRow {
