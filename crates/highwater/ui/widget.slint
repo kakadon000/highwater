@@ -1,13 +1,21 @@
 // The desktop widget: a small translucent tracker that floats over the desktop.
 // It mirrors the cards' readings — one row per provider, the same quota bar, the
-// same colours — so what it says is never a second truth. Everything it shows is
-// published by `src/widget.rs`; the window itself is frameless, skipped by the
-// taskbar, and dragged by its header like the main window is by its own.
+// same colours, the same provider mark — so what it says is never a second truth.
+// Everything it shows is published by `src/widget.rs`; the window itself is
+// frameless, skipped by the taskbar, and dragged by its header like the main
+// window is by its own. Each row wears the provider's mark on a chip tinted the
+// brand's own colour where that colour is worth wearing.
 
 import { Theme } from "theme.slint";
 
 export struct WidgetRow {
     name: string,
+    // The name's first letter, for the chip when no mark exists: Slint strings
+    // have no way to take one themselves.
+    initial: string,
+    // The provider's mark, the same one the card wears, and whether there is one.
+    mark: image,
+    has-mark: bool,
     // The card's own words: "42%", "12.3k / 50k", a balance, or the daemon's word.
     value: string,
     has-gauge: bool,
@@ -15,6 +23,32 @@ export struct WidgetRow {
     // 0 normal, 1 warning, 2 danger.
     gauge-tone: int,
     gauge-blocked: bool,
+}
+
+export global LogoBook {
+    // The chip's background: the brand's own colour where it has one worth
+    // wearing, and transparent where it has none — the chip then falls back to
+    // the palette's quiet grey and the mark to the theme's own ink.
+    public pure function tint-for(name: string) -> color {
+        if (name == "Claude" || name == "Anthropic") { return #D97757; }
+        if (name == "OpenAI" || name == "Codex") { return #10A37F; }
+        if (name == "Gemini") { return #4285F4; }
+        if (name == "Google" || name == "Antigravity") { return #4285F4; }
+        if (name == "DeepSeek") { return #4D6BFE; }
+        if (name == "Grok" || name == "xAI") { return #4B4B55; }
+        if (name == "Groq") { return #F55036; }
+        if (name == "Mistral") { return #FF7000; }
+        if (name == "MiniMax") { return #F23F5D; }
+        if (name == "Perplexity") { return #20808D; }
+        if (name == "Alibaba") { return #FF6A00; }
+        if (name == "Qwen") { return #615CED; }
+        if (name == "Poe") { return #5D5CDE; }
+        if (name == "ClinePass") { return #3B82F6; }
+        if (name == "Deepgram") { return #13EF93; }
+        if (name == "IBM" || name == "IBM Bob") { return #0F62FE; }
+        if (name == "Z.ai") { return #6C6CFF; }
+        return #00000000;
+    }
 }
 
 export global WidgetDesk {
@@ -25,6 +59,8 @@ export global WidgetDesk {
     in property <[WidgetRow]> rows;
     // The user's opacity for the card, 50..=100.
     in-out property <int> opacity;
+    // The user's size for the card: 0.9 compact, 1.0 default, 1.15 large.
+    in-out property <float> scale: 1.0;
 
     // The ✕ hides the widget and turns the setting off, exactly as the
     // preferences switch would. A click anywhere else brings the window up.
@@ -40,7 +76,7 @@ component WidgetBar inherits Rectangle {
     in property <float> percent;
     in property <int> tone;
     in property <bool> blocked;
-    height: 4px;
+    height: 3px;
     border-radius: self.height / 2;
 
     property <color> fill: tone == 2 ? Theme.error-bg : tone == 1 ? Theme.warning-bg : Theme.accent;
@@ -58,10 +94,41 @@ component WidgetBar inherits Rectangle {
     }
 }
 
+// One provider's mark: a chip in the brand's tint, the mark over it — the same
+// mark the card wears, colourized white — or the name's initial where no mark
+// exists. 24 logical px, so it reads at a glance the way a tray badge does.
+component ProviderChip inherits Rectangle {
+    in property <string> name;
+    in property <string> initial;
+    in property <image> mark;
+    in property <bool> has-mark;
+    width: 24px;
+    height: 24px;
+    border-radius: 8px;
+    background: LogoBook.tint-for(root.name) == #00000000 ? Theme.ink(0.14) : LogoBook.tint-for(root.name);
+
+    if root.has-mark: Image {
+        source: root.mark;
+        colorize: #FFFFFF;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 14px;
+        height: 14px;
+    }
+    if !root.has-mark: Text {
+        text: root.initial;
+        color: #FFFFFF;
+        font-size: Theme.body * 1.1;
+        font-weight: 700;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+}
+
 export component WidgetWindow inherits Window {
     title: "Highwater";
     no-frame: true;
-    preferred-width: 252px;
+    preferred-width: root.card-width + 20px;
     // Ten pixels of clear window on every side keep the card's shadow inside
     // the surface, the way the preferences sheet sits in its dialog.
     preferred-height: root.card-height + 20px;
@@ -74,10 +141,15 @@ export component WidgetWindow inherits Window {
     // Set from the platform, like the main window's corner-radius: an opaque
     // surface has no corners of its own to show.
     in property <bool> translucent: true;
-    property <length> card-radius: self.translucent ? 16px : 0px;
+    property <length> card-radius: self.translucent ? 18px : 0px;
 
-    // Header, one 28px row per visible provider, and the card's own padding.
-    property <length> card-height: 54px + max(WidgetDesk.rows.length, 1) * 28px;
+    property <length> pad: 12px * WidgetDesk.scale;
+    property <length> row-height: 30px * WidgetDesk.scale;
+    property <length> header-height: 34px * WidgetDesk.scale;
+
+    // Header, one row per visible provider, and the card's own padding.
+    property <length> card-width: 264px * WidgetDesk.scale;
+    property <length> card-height: root.header-height + root.pad + max(WidgetDesk.rows.length, 1) * root.row-height + root.pad;
 
     card := Rectangle {
         x: 10px;
@@ -88,17 +160,19 @@ export component WidgetWindow inherits Window {
             ? Theme.window-bg-acrylic.transparentize((100 - clamp(WidgetDesk.opacity, 50, 100)) / 260)
             : Theme.window-bg;
         border-radius: root.card-radius;
+        border-width: root.translucent ? 1px : 0px;
+        border-color: Theme.card-outline;
         drop-shadow-blur: root.translucent ? 18px : 0px;
         drop-shadow-offset-y: root.translucent ? 6px : 0px;
         drop-shadow-color: #00000059;
 
         VerticalLayout {
-            padding: 12px;
+            padding: root.pad;
 
             // The grip: dragging the card by its header, the way the main
             // window is dragged by its own.
             header := Rectangle {
-                height: 30px;
+                height: root.header-height;
                 WindowMoveArea {
                     TouchArea {
                         moved => {
@@ -107,17 +181,32 @@ export component WidgetWindow inherits Window {
                     }
                 }
                 HorizontalLayout {
+                    spacing: 8px * WidgetDesk.scale;
+
+                    Image {
+                        source: @image-url("icons/widget-logo.png");
+                        width: 20px * WidgetDesk.scale;
+                        height: 20px * WidgetDesk.scale;
+                    }
                     Text {
                         text: WidgetDesk.connected ? "Highwater" : "Highwater · waiting";
                         color: Theme.fg;
-                        font-size: Theme.body;
+                        font-size: Theme.body * WidgetDesk.scale;
                         font-weight: 700;
                         vertical-alignment: center;
                     }
                     Rectangle {}
+                    // The daemon's pulse: green while readings land, amber while
+                    // the card waits for its first one.
+                    Rectangle {
+                        width: 7px;
+                        height: 7px;
+                        border-radius: self.height / 2;
+                        background: WidgetDesk.connected ? Theme.success : Theme.warning;
+                    }
                     close := Rectangle {
-                        width: 22px;
-                        height: 22px;
+                        width: 22px * WidgetDesk.scale;
+                        height: 22px * WidgetDesk.scale;
                         border-radius: self.height / 2;
                         background: close-touch.has-hover ? Theme.ink(0.12) : transparent;
                         animate background { duration: 100ms; }
@@ -138,7 +227,7 @@ export component WidgetWindow inherits Window {
             }
 
             for row in WidgetDesk.rows: row-rect := Rectangle {
-                height: 28px;
+                height: root.row-height;
                 opacity: row.gauge-blocked ? 0.5 : 1.0;
                 open-touch := TouchArea {
                     mouse-cursor: MouseCursor.pointer;
@@ -146,30 +235,49 @@ export component WidgetWindow inherits Window {
                         WidgetDesk.open-main();
                     }
                 }
+                hover := Rectangle {
+                    border-radius: 8px;
+                    background: open-touch.has-hover ? Theme.ink(0.07) : transparent;
+                    animate background { duration: 100ms; }
+                }
                 HorizontalLayout {
+                    padding-left: 4px;
+                    padding-right: 4px;
+                    spacing: 8px * WidgetDesk.scale;
+                    // A plain wrapper: layouts center their children, and the
+                    // chip wants to sit a shade high, over its bar.
+                    Rectangle {
+                        ProviderChip {
+                            name: row.name;
+                            initial: row.initial;
+                            mark: row.mark;
+                            has-mark: row.has-mark;
+                            y: (parent.height - self.height) / 2 - 2px;
+                        }
+                    }
                     Text {
                         text: row.name;
                         color: Theme.fg;
-                        font-size: Theme.body;
+                        font-size: Theme.body * WidgetDesk.scale;
                         font-weight: 600;
                         overflow: elide;
                         vertical-alignment: center;
-                        width: parent.width - 84px;
+                        horizontal-stretch: 1;
                     }
-                    Rectangle {}
                     Text {
                         text: row.value;
                         color: Theme.ink(0.75);
-                        font-size: Theme.caption;
+                        font-size: Theme.caption * WidgetDesk.scale;
                         horizontal-alignment: right;
                         overflow: elide;
                         vertical-alignment: center;
-                        width: 78px;
+                        width: 80px * WidgetDesk.scale;
                     }
                 }
                 if row.has-gauge: WidgetBar {
+                    x: 36px * WidgetDesk.scale;
                     y: parent.height - self.height - 2px;
-                    width: parent.width;
+                    width: parent.width - 40px * WidgetDesk.scale;
                     percent: row.gauge-percent;
                     tone: row.gauge-tone;
                     blocked: row.gauge-blocked;
@@ -177,11 +285,11 @@ export component WidgetWindow inherits Window {
             }
 
             if WidgetDesk.rows.length == 0: Rectangle {
-                height: 28px;
+                height: root.row-height;
                 Text {
                     text: WidgetDesk.connected ? "No providers configured." : "Waiting for Highwater…";
                     color: Theme.ink(0.55);
-                    font-size: Theme.caption;
+                    font-size: Theme.caption * WidgetDesk.scale;
                     vertical-alignment: center;
                 }
             }

@@ -156,6 +156,12 @@ impl PreferencesDialog {
         prefs.set_widget_enabled(dialog.widget.enabled());
         prefs.set_widget_top(dialog.widget.on_top());
         prefs.set_widget_opacity(dialog.widget.opacity());
+        prefs.set_widget_scale_choice(
+            crate::widget::SCALES
+                .iter()
+                .position(|scale| *scale == dialog.widget.scale())
+                .unwrap_or(1) as i32,
+        );
         prefs.set_open(true);
         // The acrylic sits behind the sheet; it must be armed while the window it
         // belongs to exists, and opening preferences is the first moment that is sure.
@@ -223,6 +229,18 @@ impl PreferencesDialog {
         prefs.on_widget_opacity_changed({
             let widget = Rc::clone(&self.widget);
             move |opacity| widget.set_opacity(opacity)
+        });
+        prefs.on_widget_scale_changed({
+            let widget = Rc::clone(&self.widget);
+            move |index| {
+                if let Some(scale) = crate::widget::SCALES.get(index.clamp(0, 2) as usize) {
+                    widget.set_scale(*scale);
+                }
+            }
+        });
+        prefs.on_widget_reset_position({
+            let widget = Rc::clone(&self.widget);
+            move || widget.reset_position()
         });
     }
 

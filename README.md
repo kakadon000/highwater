@@ -37,6 +37,10 @@ notifications stay current. Native Rust and Slint — no Electron, no embedded b
   switched on per window so you only hear about the ones you care about.
 - **History and a burn-down chart.** Click a card to see how the current window was spent.
 - **Lives in the tray.** Closing the window hides it; readings keep arriving.
+- **A desktop widget.** A small translucent card that floats over the desktop, draggable by
+  its header: one row per provider — the provider's own mark on its brand colour, the same
+  reading and quota bar the cards show — with its own size, opacity and always-on-top
+  settings, shown or hidden from the tray, the preferences or the card itself.
 
 ---
 

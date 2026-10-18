@@ -22,18 +22,29 @@ use crate::ui::{Theme, WidgetDesk, WidgetRow, WidgetWindow};
 /// the cap becomes a single "and N more" row that opens the window.
 pub const MAX_ROWS: usize = 14;
 
+/// The widget's size choices, as the preferences sheet offers them: compact,
+/// default, large. The config file carries the percentage itself.
+pub const SCALES: [i32; 3] = [90, 100, 115];
+
 /// The client's own widget settings, as the JSON file carries them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct WidgetConfig {
-    #[serde(default)]
+    #[serde(default = "default_enabled")]
     enabled: bool,
     #[serde(default = "default_on_top")]
     on_top: bool,
     #[serde(default = "default_opacity")]
     opacity: i32,
+    /// The card's size, as a percentage: one of [`SCALES`].
+    #[serde(default = "default_scale")]
+    scale: i32,
     /// The last physical position the card was dragged to, `[x, y]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     position: Option<[i32; 2]>,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 fn default_on_top() -> bool {
@@ -44,12 +55,17 @@ fn default_opacity() -> i32 {
     85
 }
 
+fn default_scale() -> i32 {
+    100
+}
+
 impl Default for WidgetConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_enabled(),
             on_top: default_on_top(),
             opacity: default_opacity(),
+            scale: default_scale(),
             position: None,
         }
     }
@@ -126,6 +142,7 @@ impl WidgetPanel {
         let desk = ui.global::<WidgetDesk>();
         desk.set_acrylic(translucent);
         desk.set_opacity(panel.config.borrow().opacity);
+        desk.set_scale(panel.config.borrow().scale as f32 / 100.0);
         desk.set_rows(slint::ModelRc::from(Rc::clone(&panel.rows)));
         let weak = Rc::downgrade(&panel);
         desk.on_hide(move || {
@@ -253,6 +270,45 @@ impl WidgetPanel {
         self.config.borrow().opacity
     }
 
+    /// The card's size, as the percentage the config carries.
+    pub fn scale(&self) -> i32 {
+        self.config.borrow().scale
+    }
+
+    /// Resizes the card to the nearest size the widget offers, so a config
+    /// written by hand cannot land between the choices.
+    pub fn set_scale(&self, scale: i32) {
+        let scale = SCALES
+            .iter()
+            .copied()
+            .min_by_key(|choice| (choice - scale).abs())
+            .unwrap_or_default();
+        {
+            let mut config = self.config.borrow_mut();
+            if config.scale == scale {
+                return;
+            }
+            config.scale = scale;
+        }
+        self.persist();
+        if let Some(ui) = self.ui.upgrade() {
+            ui.global::<WidgetDesk>().set_scale(scale as f32 / 100.0);
+        }
+    }
+
+    /// Forgets where the card was dragged and puts it back at its desktop
+    /// corner, the way a first launch would find it.
+    pub fn reset_position(&self) {
+        self.config.borrow_mut().position = None;
+        self.persist();
+        self.saved_at.set(None);
+        if let Some(ui) = self.ui.upgrade()
+            && ui.window().is_visible()
+        {
+            self.place();
+        }
+    }
+
     /// Hears about the widget from elsewhere — the interface keeps the tray's
     /// checkbox and the preferences rows in step with what actually happened.
     pub fn on_event(&self, listener: Rc<dyn Fn(Event)>) {
@@ -303,8 +359,8 @@ impl WidgetPanel {
         );
     }
 
-    /// Shows the window, puts it where it was last dragged — or at a desktop
-    /// corner the first time — and raises it so a toggle is always felt.
+    /// Shows the window and puts it where it was last dragged — or at a
+    /// desktop corner the first time. It takes no focus: it is a gadget.
     fn show(&self) {
         let Some(ui) = self.ui.upgrade() else {
             return;
@@ -315,8 +371,6 @@ impl WidgetPanel {
         }
         self.arm_backdrop();
         self.place();
-        ui.window()
-            .with_winit_window(|window| window.focus_window());
     }
 
     /// Puts the card where the settings file says, clamped into the monitor it
@@ -373,16 +427,22 @@ impl WidgetPanel {
 
     /// A desktop widget is not an application to the taskbar: it has no taskbar
     /// entry and no alt-tab stop, like every gadget that ever sat on a desktop.
+    /// It takes no focus either: toggling it must never yank the keyboard out
+    /// of whatever the user was typing, the way a gadget never does.
     fn skip_taskbar(&self) {
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
         #[cfg(windows)]
         {
-            let Some(ui) = self.ui.upgrade() else {
-                return;
-            };
             use slint::winit_030::winit::platform::windows::WindowExtWindows;
             ui.window()
                 .with_winit_window(|window| window.set_skip_taskbar(true));
+            ui.window().with_winit_window(|window| {
+                window.set_focusable(false);
+            });
         }
+        let _ = &ui;
     }
 
     /// The system backdrop behind the card, exactly as the preferences sheet has
@@ -451,12 +511,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_ask_for_the_widget_hidden_on_top_and_mostly_solid() {
+    fn defaults_ask_for_the_widget_shown_on_top_and_mostly_solid() {
         let config = WidgetConfig::default();
-        assert!(!config.enabled);
+        assert!(config.enabled);
         assert!(config.on_top);
         assert_eq!(config.opacity, 85);
+        assert_eq!(config.scale, 100);
         assert_eq!(config.position, None);
+    }
+
+    #[test]
+    fn a_size_never_lands_between_the_choices() {
+        let panel_scale = |asked: i32| {
+            SCALES
+                .iter()
+                .copied()
+                .min_by_key(|choice| (choice - asked).abs())
+                .unwrap_or_default()
+        };
+        assert_eq!(panel_scale(90), 90);
+        assert_eq!(panel_scale(95), 90);
+        assert_eq!(panel_scale(100), 100);
+        assert_eq!(panel_scale(107), 100);
+        assert_eq!(panel_scale(115), 115);
+        assert_eq!(panel_scale(130), 115);
     }
 
     #[test]

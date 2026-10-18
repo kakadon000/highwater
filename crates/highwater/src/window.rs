@@ -112,14 +112,33 @@ fn gauge_data(gauge: &Gauge) -> GaugeData {
     }
 }
 
+/// An image that draws nothing, for a row whose provider has no mark: the chip
+/// shows the name's initial instead.
+fn no_mark() -> slint::Image {
+    slint::Image::from_rgba8(slint::SharedPixelBuffer::new(1, 1))
+}
+
 /// One widget row from what the card would show: the same reading, the same
-/// words, one bar. A balance is its amount; a blank is the daemon's word.
-fn widget_row(status: &ProviderStatus, now: Timestamp, titles: &model::Titles) -> WidgetRow {
+/// words, the same mark, one bar. A balance is its amount; a blank is the
+/// daemon's word.
+fn widget_row(
+    status: &ProviderStatus,
+    now: Timestamp,
+    titles: &model::Titles,
+    marks: &Marks,
+) -> WidgetRow {
     let card = view::card(status, now);
     let name = model::name(titles, &status.provider);
+    let initial = name.chars().next().unwrap_or(' ').to_string();
+    let mark = marks.get(&status.provider);
+    let has_mark = mark.is_some();
+    let mark = mark.unwrap_or_else(no_mark);
     match card.body {
         Body::Reading(reading) => WidgetRow {
+            initial: initial.into(),
             name: name.into(),
+            mark,
+            has_mark,
             value: reading.headline.into(),
             has_gauge: reading.gauge.is_some(),
             gauge_percent: reading
@@ -134,7 +153,10 @@ fn widget_row(status: &ProviderStatus, now: Timestamp, titles: &model::Titles) -
             gauge_blocked: reading.blocked,
         },
         Body::Balance { whole, fraction } => WidgetRow {
+            initial: initial.into(),
             name: name.into(),
+            mark,
+            has_mark,
             value: format!("{whole}{}", fraction.unwrap_or_default()).into(),
             has_gauge: false,
             gauge_percent: 0.0,
@@ -142,7 +164,10 @@ fn widget_row(status: &ProviderStatus, now: Timestamp, titles: &model::Titles) -
             gauge_blocked: false,
         },
         Body::Blank(message) => WidgetRow {
+            initial: initial.into(),
             name: name.into(),
+            mark,
+            has_mark,
             value: message.into(),
             has_gauge: false,
             gauge_percent: 0.0,
@@ -961,13 +986,16 @@ impl MainWindow {
             .iter()
             .zip(statuses)
             .filter(|(placement, _)| placement.main && placement.shown)
-            .map(|(_, status)| widget_row(status, now, &titles))
+            .map(|(_, status)| widget_row(status, now, &titles, &self.marks))
             .collect();
         if rows.len() > crate::widget::MAX_ROWS {
             let hidden = rows.len() - (crate::widget::MAX_ROWS - 1);
             rows.truncate(crate::widget::MAX_ROWS - 1);
             rows.push(WidgetRow {
+                initial: "…".into(),
                 name: format!("… and {hidden} more").into(),
+                mark: no_mark(),
+                has_mark: false,
                 value: "Open Highwater".into(),
                 has_gauge: false,
                 gauge_percent: 0.0,

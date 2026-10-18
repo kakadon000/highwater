@@ -51,6 +51,8 @@ export global Prefs {
     in-out property <bool> widget-enabled;
     in-out property <bool> widget-top;
     in-out property <int> widget-opacity;
+    // The size as a menu index: 0 compact, 1 default, 2 large.
+    in-out property <int> widget-scale-choice;
 
     // A row waiting for the daemon's answer, which is what bounds how fast it can send.
     in property <bool> busy-minimize;
@@ -88,6 +90,8 @@ export global Prefs {
     callback widget-enabled-changed(bool);
     callback widget-top-changed(bool);
     callback widget-opacity-changed(int);
+    callback widget-scale-changed(int);
+    callback widget-reset-position();
 
     public function show-toast(message: string) {
         self.toast = message;
@@ -228,7 +232,6 @@ component GeneralPage inherits Page {
                 title: "Opacity";
                 subtitle: "How much of the desktop shows through.";
                 first: false;
-                last: true;
                 value: Prefs.widget-opacity;
                 minimum: 50;
                 maximum: 100;
@@ -236,6 +239,32 @@ component GeneralPage inherits Page {
                 changed(opacity) => {
                     Prefs.widget-opacity = opacity;
                     Prefs.widget-opacity-changed(opacity);
+                }
+            }
+            ComboRow {
+                title: "Size";
+                subtitle: "How large the card sits on the desktop.";
+                first: false;
+                choices: ["Compact", "Default", "Large"];
+                selected: Prefs.widget-scale-choice;
+                enabled: Prefs.widget-enabled;
+                chosen(index) => {
+                    Prefs.widget-scale-choice = index;
+                    Prefs.widget-scale-changed(index);
+                }
+            }
+            ActionRow {
+                title: "Reset position";
+                subtitle: "Put the widget back at the bottom-right corner of your screen.";
+                first: false;
+                last: true;
+                Button {
+                    text: "Reset";
+                    kind: 1;
+                    enabled: Prefs.widget-enabled;
+                    clicked => {
+                        Prefs.widget-reset-position();
+                    }
                 }
             }
         }
