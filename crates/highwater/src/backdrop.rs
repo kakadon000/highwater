@@ -44,12 +44,14 @@ const ACCENT_TINT: u32 = 0x59262222;
 
 /// Arms the backdrop on the window the preferences sheet opens in.
 pub fn attach(ui: &AppWindow) {
-    if ui.window().with_winit_window(attach_to_window).is_none() {
+    if ui.window().with_winit_window(attach_window).is_none() {
         tracing::warn!("preferences opened before the window existed; no acrylic");
     }
 }
 
-fn attach_to_window(window: &Window) {
+/// Arms the backdrop on any one winit window: the preferences sheet and the
+/// desktop widget float over the same system acrylic.
+pub fn attach_window(window: &Window) {
     let Some(hwnd) = hwnd(window) else {
         tracing::warn!("the window has no Win32 handle; preferences stay opaque");
         return;

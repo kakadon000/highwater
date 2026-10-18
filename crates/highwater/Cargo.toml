@@ -23,6 +23,8 @@ pulldown-cmark = { version = "0.13.4", default-features = false }
 rfd = "0.17.2"
 semver = "1.0.28"
 serde_json = "1.0.151"
+# The desktop widget's own settings file: this client's data, not the daemon's.
+serde = { version = "1.0.228", features = ["derive"] }
 # `~`: the winit accessor behind `unstable-winit-030` may change in any minor release.
 slint = { version = "~1.18.1", features = ["unstable-winit-030"] }
 highwater-ipc = { path = "../highwater-ipc" }

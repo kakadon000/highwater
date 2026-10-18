@@ -46,6 +46,12 @@ export global Prefs {
     in property <string> key-schema;
     in property <string> token-schema;
 
+    // The desktop widget is the one setting this client owns itself: the daemon
+    // has no window to place. No busy states — a row here answers at once.
+    in-out property <bool> widget-enabled;
+    in-out property <bool> widget-top;
+    in-out property <int> widget-opacity;
+
     // A row waiting for the daemon's answer, which is what bounds how fast it can send.
     in property <bool> busy-minimize;
     in property <bool> busy-startup;
@@ -77,6 +83,11 @@ export global Prefs {
     callback choose-proxy-mode(int);
     callback apply-proxy();
     callback clear-history();
+    // The client-side widget rows: applied at once, remembered in the client's
+    // own settings file, nothing round-trips through the daemon.
+    callback widget-enabled-changed(bool);
+    callback widget-top-changed(bool);
+    callback widget-opacity-changed(int);
 
     public function show-toast(message: string) {
         self.toast = message;
@@ -183,6 +194,48 @@ component GeneralPage inherits Page {
                 enabled: !Prefs.columns-auto && !Prefs.busy-columns;
                 changed(columns) => {
                     Prefs.set-columns(columns);
+                }
+            }
+        }
+    }
+    VerticalLayout {
+        GroupHeading {
+            title: "Desktop widget";
+            description: "A small tracker that floats over your desktop, draggable by its header.";
+        }
+        BoxedList {
+            SwitchRow {
+                title: "Show desktop widget";
+                subtitle: "One row per provider, the same readings the cards show.";
+                checked: Prefs.widget-enabled;
+                toggled(on) => {
+                    Prefs.widget-enabled = on;
+                    Prefs.widget-enabled-changed(on);
+                }
+            }
+            SwitchRow {
+                title: "Keep on top";
+                subtitle: "The widget stays above other windows.";
+                first: false;
+                checked: Prefs.widget-top;
+                enabled: Prefs.widget-enabled;
+                toggled(on) => {
+                    Prefs.widget-top = on;
+                    Prefs.widget-top-changed(on);
+                }
+            }
+            SpinRow {
+                title: "Opacity";
+                subtitle: "How much of the desktop shows through.";
+                first: false;
+                last: true;
+                value: Prefs.widget-opacity;
+                minimum: 50;
+                maximum: 100;
+                enabled: Prefs.widget-enabled;
+                changed(opacity) => {
+                    Prefs.widget-opacity = opacity;
+                    Prefs.widget-opacity-changed(opacity);
                 }
             }
         }

@@ -2380,7 +2380,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "highwater"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "async-channel",
  "async-io",
@@ -2390,6 +2390,7 @@ dependencies = [
  "pulldown-cmark",
  "rfd",
  "semver",
+ "serde",
  "serde_json",
  "slint",
  "slint-build",
@@ -2409,7 +2410,7 @@ dependencies = [
 
 [[package]]
 name = "highwater-cli"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "async-io",
  "clap",
@@ -2424,7 +2425,7 @@ dependencies = [
 
 [[package]]
 name = "highwater-core"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm",
@@ -2459,7 +2460,7 @@ dependencies = [
 
 [[package]]
 name = "highwater-ipc"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "async-io",
  "highwater-types",
@@ -2468,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "highwater-types"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "serde",
  "zvariant",
@@ -2476,7 +2477,7 @@ dependencies = [
 
 [[package]]
 name = "highwaterd"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "highwater-core",
  "highwater-types",

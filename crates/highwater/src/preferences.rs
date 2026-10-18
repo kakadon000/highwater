@@ -14,6 +14,7 @@ use slint::{ComponentHandle, SharedString};
 use crate::alert::{Alerts, Question};
 use crate::bus::DaemonProxy;
 use crate::provider_settings::reason;
+use crate::widget::WidgetPanel;
 use crate::window::spawn;
 use crate::{AppWindow, Prefs};
 
@@ -108,6 +109,8 @@ pub struct PreferencesDialog {
     ui: slint::Weak<AppWindow>,
     daemon: Daemon,
     alerts: Rc<Alerts>,
+    /// The widget rows answer to this client, not to the daemon.
+    widget: Rc<WidgetPanel>,
     preferences: RefCell<Preferences>,
     data: RefCell<DataInfo>,
     on_closed: Box<dyn Fn()>,
@@ -129,6 +132,7 @@ impl PreferencesDialog {
         ui: &AppWindow,
         daemon: Daemon,
         alerts: Rc<Alerts>,
+        widget: Rc<WidgetPanel>,
         preferences: &Preferences,
         data: &DataInfo,
         on_closed: impl Fn() + 'static,
@@ -137,6 +141,7 @@ impl PreferencesDialog {
             ui: ui.as_weak(),
             daemon,
             alerts,
+            widget,
             preferences: RefCell::new(preferences.clone()),
             data: RefCell::new(data.clone()),
             on_closed: Box::new(on_closed),
@@ -146,6 +151,11 @@ impl PreferencesDialog {
         let prefs = ui.global::<Prefs>();
         prefs.set_page(0);
         dialog.render();
+        // The widget's rows are the client's truth, set once here: whatever the
+        // tray or the ✕ did since the last open is what the sheet now shows.
+        prefs.set_widget_enabled(dialog.widget.enabled());
+        prefs.set_widget_top(dialog.widget.on_top());
+        prefs.set_widget_opacity(dialog.widget.opacity());
         prefs.set_open(true);
         // The acrylic sits behind the sheet; it must be armed while the window it
         // belongs to exists, and opening preferences is the first moment that is sure.
@@ -201,6 +211,19 @@ impl PreferencesDialog {
         }));
         prefs.on_apply_proxy(with(|dialog| dialog.submit_proxy(Complaint::Loud)));
         prefs.on_clear_history(with(Self::clear_history));
+        // Client-side rows: applied at once, no daemon, no busy state.
+        prefs.on_widget_enabled_changed({
+            let widget = Rc::clone(&self.widget);
+            move |enabled| widget.set_enabled(enabled)
+        });
+        prefs.on_widget_top_changed({
+            let widget = Rc::clone(&self.widget);
+            move |on_top| widget.set_on_top(on_top)
+        });
+        prefs.on_widget_opacity_changed({
+            let widget = Rc::clone(&self.widget);
+            move |opacity| widget.set_opacity(opacity)
+        });
     }
 
     /// Takes what the daemon now says, and redraws every row from it.

@@ -1,0 +1,190 @@
+// The desktop widget: a small translucent tracker that floats over the desktop.
+// It mirrors the cards' readings — one row per provider, the same quota bar, the
+// same colours — so what it says is never a second truth. Everything it shows is
+// published by `src/widget.rs`; the window itself is frameless, skipped by the
+// taskbar, and dragged by its header like the main window is by its own.
+
+import { Theme } from "theme.slint";
+
+export struct WidgetRow {
+    name: string,
+    // The card's own words: "42%", "12.3k / 50k", a balance, or the daemon's word.
+    value: string,
+    has-gauge: bool,
+    gauge-percent: float,
+    // 0 normal, 1 warning, 2 danger.
+    gauge-tone: int,
+    gauge-blocked: bool,
+}
+
+export global WidgetDesk {
+    // The card goes translucent only where the window's surface keeps its alpha:
+    // over the system's acrylic on Windows 10/11, over the compositor elsewhere.
+    in property <bool> acrylic;
+    in-out property <bool> connected;
+    in property <[WidgetRow]> rows;
+    // The user's opacity for the card, 50..=100.
+    in-out property <int> opacity;
+
+    // The ✕ hides the widget and turns the setting off, exactly as the
+    // preferences switch would. A click anywhere else brings the window up.
+    callback hide();
+    callback open-main();
+    // A header drag ended: the position is saved so the next launch opens here.
+    callback moved();
+}
+
+// The same track, fill and tone rules the cards' QuotaBar draws, at a third of
+// the thickness a card can afford.
+component WidgetBar inherits Rectangle {
+    in property <float> percent;
+    in property <int> tone;
+    in property <bool> blocked;
+    height: 4px;
+    border-radius: self.height / 2;
+
+    property <color> fill: tone == 2 ? Theme.error-bg : tone == 1 ? Theme.warning-bg : Theme.accent;
+
+    Rectangle {
+        border-radius: self.height / 2;
+        background: Theme.ink(0.15);
+    }
+    if root.percent > 0: Rectangle {
+        width: max(self.height, min(root.percent / 100 * parent.width, parent.width));
+        border-radius: self.height / 2;
+        background: root.fill;
+        opacity: root.blocked ? 0.5 : 1;
+        animate width { duration: 300ms; easing: cubic-bezier(0.33, 1, 0.68, 1); }
+    }
+}
+
+export component WidgetWindow inherits Window {
+    title: "Highwater";
+    no-frame: true;
+    preferred-width: 252px;
+    // Ten pixels of clear window on every side keep the card's shadow inside
+    // the surface, the way the preferences sheet sits in its dialog.
+    preferred-height: root.card-height + 20px;
+    // The compositor can only show the desktop through the card's corners when
+    // the window itself clears to transparent.
+    background: transparent;
+    default-font-family: "Rubik";
+    default-font-size: Theme.body;
+
+    // Set from the platform, like the main window's corner-radius: an opaque
+    // surface has no corners of its own to show.
+    in property <bool> translucent: true;
+    property <length> card-radius: self.translucent ? 16px : 0px;
+
+    // Header, one 28px row per visible provider, and the card's own padding.
+    property <length> card-height: 54px + max(WidgetDesk.rows.length, 1) * 28px;
+
+    card := Rectangle {
+        x: 10px;
+        y: 10px;
+        width: parent.width - 20px;
+        height: root.card-height;
+        background: WidgetDesk.acrylic
+            ? Theme.window-bg-acrylic.transparentize((100 - clamp(WidgetDesk.opacity, 50, 100)) / 260)
+            : Theme.window-bg;
+        border-radius: root.card-radius;
+        drop-shadow-blur: root.translucent ? 18px : 0px;
+        drop-shadow-offset-y: root.translucent ? 6px : 0px;
+        drop-shadow-color: #00000059;
+
+        VerticalLayout {
+            padding: 12px;
+
+            // The grip: dragging the card by its header, the way the main
+            // window is dragged by its own.
+            header := Rectangle {
+                height: 30px;
+                WindowMoveArea {
+                    TouchArea {
+                        moved => {
+                            WidgetDesk.moved();
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    Text {
+                        text: WidgetDesk.connected ? "Highwater" : "Highwater · waiting";
+                        color: Theme.fg;
+                        font-size: Theme.body;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {}
+                    close := Rectangle {
+                        width: 22px;
+                        height: 22px;
+                        border-radius: self.height / 2;
+                        background: close-touch.has-hover ? Theme.ink(0.12) : transparent;
+                        animate background { duration: 100ms; }
+                        Image {
+                            source: @image-url("icons/window-close-symbolic.svg");
+                            width: 12px;
+                            height: 12px;
+                            colorize: Theme.fg.transparentize(0.35);
+                        }
+                        close-touch := TouchArea {
+                            mouse-cursor: MouseCursor.pointer;
+                            clicked => {
+                                WidgetDesk.hide();
+                            }
+                        }
+                    }
+                }
+            }
+
+            for row in WidgetDesk.rows: row-rect := Rectangle {
+                height: 28px;
+                opacity: row.gauge-blocked ? 0.5 : 1.0;
+                open-touch := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => {
+                        WidgetDesk.open-main();
+                    }
+                }
+                HorizontalLayout {
+                    Text {
+                        text: row.name;
+                        color: Theme.fg;
+                        font-size: Theme.body;
+                        font-weight: 600;
+                        overflow: elide;
+                        vertical-alignment: center;
+                        width: parent.width - 84px;
+                    }
+                    Rectangle {}
+                    Text {
+                        text: row.value;
+                        color: Theme.ink(0.75);
+                        font-size: Theme.caption;
+                        horizontal-alignment: right;
+                        overflow: elide;
+                        vertical-alignment: center;
+                        width: 78px;
+                    }
+                }
+                if row.has-gauge: WidgetBar {
+                    y: parent.height - self.height - 2px;
+                    width: parent.width;
+                    percent: row.gauge-percent;
+                    tone: row.gauge-tone;
+                    blocked: row.gauge-blocked;
+                }
+            }
+
+            if WidgetDesk.rows.length == 0: Rectangle {
+                height: 28px;
+                Text {
+                    text: WidgetDesk.connected ? "No providers configured." : "Waiting for Highwater…";
+                    color: Theme.ink(0.55);
+                    font-size: Theme.caption;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

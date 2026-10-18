@@ -23,7 +23,11 @@ use crate::provider_settings::{self, CardAction, ProviderDialog};
 use crate::tray::{self, Tray};
 use crate::update::UpdateNotice;
 use crate::view::{self, Body, Gauge, Tone};
-use crate::{AppWindow, CardData, GaugeData, MenuEntry, RowData, Theme, format, model, update};
+use crate::widget::{Event as WidgetEvent, WidgetPanel};
+use crate::{
+    AppWindow, CardData, GaugeData, MenuEntry, Prefs, RowData, Theme, WidgetRow, format, model,
+    update,
+};
 
 /// How often the clock-dependent parts of every card are redrawn.
 const TICK: std::time::Duration = std::time::Duration::from_secs(30);
@@ -108,6 +112,46 @@ fn gauge_data(gauge: &Gauge) -> GaugeData {
     }
 }
 
+/// One widget row from what the card would show: the same reading, the same
+/// words, one bar. A balance is its amount; a blank is the daemon's word.
+fn widget_row(status: &ProviderStatus, now: Timestamp, titles: &model::Titles) -> WidgetRow {
+    let card = view::card(status, now);
+    let name = model::name(titles, &status.provider);
+    match card.body {
+        Body::Reading(reading) => WidgetRow {
+            name: name.into(),
+            value: reading.headline.into(),
+            has_gauge: reading.gauge.is_some(),
+            gauge_percent: reading
+                .gauge
+                .as_ref()
+                .map_or(0.0, |gauge| gauge.percent as f32),
+            gauge_tone: reading.gauge.as_ref().map_or(0, |gauge| match gauge.tone {
+                Tone::Normal => 0,
+                Tone::Warning => 1,
+                Tone::Danger => 2,
+            }),
+            gauge_blocked: reading.blocked,
+        },
+        Body::Balance { whole, fraction } => WidgetRow {
+            name: name.into(),
+            value: format!("{whole}{}", fraction.unwrap_or_default()).into(),
+            has_gauge: false,
+            gauge_percent: 0.0,
+            gauge_tone: 0,
+            gauge_blocked: false,
+        },
+        Body::Blank(message) => WidgetRow {
+            name: name.into(),
+            value: message.into(),
+            has_gauge: false,
+            gauge_percent: 0.0,
+            gauge_tone: 0,
+            gauge_blocked: false,
+        },
+    }
+}
+
 /// Equal by content. `ModelRc` compares by identity, and every redraw builds new rows; an
 /// empty `Image` is never equal to anything, itself included, so a card without a mark
 /// would always differ.
@@ -165,6 +209,8 @@ pub struct MainWindow {
     /// The panel icon, once a status-notifier host has accepted it. `None` in a session
     /// that has none, which is also what leaves the close button closing the program.
     tray: RefCell<Option<Tray>>,
+    /// The desktop widget: this client's own window, fed from the same redraw.
+    widget: Rc<WidgetPanel>,
     /// Read at close time, so changing the preference needs no reconnect.
     minimize_on_close: Cell<bool>,
     clock: slint::Timer,
@@ -185,9 +231,22 @@ impl MainWindow {
     /// Builds the window's state and connects it to the daemon. A `background` start is the
     /// session's autostart: the window stays hidden, and the process stays only if a panel
     /// accepts the tray icon, rather than leaving something invisible behind.
-    pub fn start(ui: &AppWindow, renderer: String, background: bool) -> Rc<Self> {
+    pub fn start(
+        ui: &AppWindow,
+        renderer: String,
+        background: bool,
+        widget_translucent: bool,
+    ) -> Rc<Self> {
         let cards = Rc::new(VecModel::default());
         ui.set_cards(ModelRc::from(Rc::clone(&cards)));
+        let widget = WidgetPanel::start(widget_translucent, {
+            let weak_ui = ui.as_weak();
+            move || {
+                if let Some(ui) = weak_ui.upgrade() {
+                    present(&ui);
+                }
+            }
+        });
         let main = Rc::new(Self {
             ui: ui.as_weak(),
             cards,
@@ -219,12 +278,21 @@ impl MainWindow {
             renderer,
             update_notice: RefCell::new(UpdateNotice::new(env!("CARGO_PKG_VERSION"))),
             tray: RefCell::default(),
+            widget,
             minimize_on_close: Cell::new(true),
             clock: slint::Timer::default(),
         });
         ui.set_message("Connecting…".into());
 
         let weak = Rc::downgrade(&main);
+        main.widget.on_event({
+            let weak = weak.clone();
+            Rc::new(move |event| {
+                if let Some(main) = weak.upgrade() {
+                    main.widget_event(event);
+                }
+            })
+        });
         ui.on_refresh(Self::callback(&weak, |main| main.refresh_now()));
         ui.on_open_release(Self::callback(&weak, |main| main.open_release()));
         ui.on_open_preferences({
@@ -300,6 +368,7 @@ impl MainWindow {
             move || {
                 if let Some(main) = weak.upgrade() {
                     main.redraw();
+                    main.widget.save_position(false);
                     if let Some(detail) = main.detail.borrow().clone() {
                         detail.tick();
                     }
@@ -330,6 +399,9 @@ impl MainWindow {
                     )
                 });
                 if !hide {
+                    if let Some(main) = weak.upgrade() {
+                        main.widget.save_position(true);
+                    }
                     quit();
                 }
                 slint::CloseRequestResponse::HideWindow
@@ -388,9 +460,11 @@ impl MainWindow {
                 }
             }
             tray::Command::Refresh => self.refresh_now(),
+            tray::Command::ToggleWidget => self.widget.toggle(),
             tray::Command::Quit => {
                 // Taken down here rather than left to the process exit, which on Windows
                 // leaves the icon in the notification area until the pointer passes over it.
+                self.widget.save_position(true);
                 self.tray.take();
                 quit();
             }
@@ -404,7 +478,21 @@ impl MainWindow {
                 &self.statuses.borrow(),
                 &model::titles(&self.definitions.borrow()),
                 self.daemon.borrow().is_some(),
+                self.widget.enabled(),
             );
+        }
+    }
+
+    /// The widget's own setting moved, wherever it was moved from: the tray's
+    /// checkbox and the preferences rows now follow what actually happened.
+    fn widget_event(&self, event: WidgetEvent) {
+        match event {
+            WidgetEvent::Enabled(enabled) => {
+                self.update_tray();
+                if let Some(ui) = self.ui.upgrade() {
+                    ui.global::<Prefs>().set_widget_enabled(enabled);
+                }
+            }
         }
     }
 
@@ -469,6 +557,8 @@ impl MainWindow {
                 self.show_update("");
                 ui.set_message(reason.into());
                 ui.set_page(PAGE_WAITING);
+                // The widget says "waiting" too, over the readings it last had.
+                self.redraw();
                 if let Some(detail) = self.detail.borrow().clone() {
                     detail.disconnected();
                 }
@@ -496,6 +586,7 @@ impl MainWindow {
             &ui,
             daemon,
             Rc::clone(&self.alerts),
+            Rc::clone(&self.widget),
             &self.preferences.borrow(),
             &self.data.borrow(),
             move || {
@@ -855,7 +946,36 @@ impl MainWindow {
                 .filter(|placement| placement.shown)
                 .count() as i32,
         );
+        self.publish_widget(&statuses, &placements);
         self.update_tray();
+    }
+
+    /// The widget's rows: one per provider the grid shows a main card for, in the
+    /// grid's order, drawn from the same readings the cards draw — never a second
+    /// opinion about anything. More than [`widget::MAX_ROWS`](crate::widget) rows
+    /// collapse into one that opens the window.
+    fn publish_widget(&self, statuses: &[ProviderStatus], placements: &[Placement]) {
+        let now = Timestamp::now();
+        let titles = model::titles(&self.definitions.borrow());
+        let mut rows: Vec<WidgetRow> = placements
+            .iter()
+            .zip(statuses)
+            .filter(|(placement, _)| placement.main && placement.shown)
+            .map(|(_, status)| widget_row(status, now, &titles))
+            .collect();
+        if rows.len() > crate::widget::MAX_ROWS {
+            let hidden = rows.len() - (crate::widget::MAX_ROWS - 1);
+            rows.truncate(crate::widget::MAX_ROWS - 1);
+            rows.push(WidgetRow {
+                name: format!("… and {hidden} more").into(),
+                value: "Open Highwater".into(),
+                has_gauge: false,
+                gauge_percent: 0.0,
+                gauge_tone: 0,
+                gauge_blocked: false,
+            });
+        }
+        self.widget.publish(rows, self.daemon.borrow().is_some());
     }
 
     fn card_data(
@@ -1044,6 +1164,7 @@ impl MainWindow {
                     channel(green),
                     channel(blue),
                 ));
+                self.widget.set_accent([red, green, blue]);
             }
             Appearance::Accent(None) => {}
         }
@@ -1059,6 +1180,7 @@ impl MainWindow {
             _ => self.system_dark.get(),
         };
         ui.global::<Theme>().set_dark(dark);
+        self.widget.set_appearance(dark);
     }
 
     fn show_update(&self, version: &str) {

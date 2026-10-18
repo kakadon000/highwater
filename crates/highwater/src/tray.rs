@@ -40,6 +40,8 @@ pub enum Command {
     Present,
     /// Poll every provider now — the header bar's refresh button, from the panel.
     Refresh,
+    /// Show or hide the desktop widget, exactly as the preferences switch would.
+    ToggleWidget,
     /// Leave. The only way out once the window closes to the tray instead of exiting.
     Quit,
 }
@@ -152,15 +154,23 @@ pub struct State {
     /// Whether the daemon is answering. Drives what the menu says instead of accounts, and
     /// whether refreshing is offered at all.
     pub connected: bool,
+    /// Whether the desktop widget is on the desktop. Drives the menu's checkbox.
+    pub widget_enabled: bool,
 }
 
 impl State {
     /// What the interface currently knows, as the tray needs it.
-    pub fn of(statuses: &[ProviderStatus], titles: &model::Titles, connected: bool) -> Self {
+    pub fn of(
+        statuses: &[ProviderStatus],
+        titles: &model::Titles,
+        connected: bool,
+        widget_enabled: bool,
+    ) -> Self {
         Self {
             entries: entries(statuses, titles),
             attention: needs_attention(statuses),
             connected,
+            widget_enabled,
         }
     }
 }
@@ -204,6 +214,14 @@ enum MenuItem {
         // would not, so it never reads the field. Inert on Linux.
         #[cfg_attr(windows, allow(dead_code))]
         icon: String,
+        enabled: bool,
+        command: Command,
+    },
+    /// A checkbox row: what it shows is a setting's truth, and choosing it asks
+    /// for the opposite.
+    Toggle {
+        label: String,
+        checked: bool,
         enabled: bool,
         command: Command,
     },
@@ -267,6 +285,12 @@ impl Backend for Model {
             icon: "view-refresh-symbolic".to_owned(),
             enabled: self.state.connected,
             command: Command::Refresh,
+        });
+        items.push(MenuItem::Toggle {
+            label: "Desktop widget".to_owned(),
+            checked: self.state.widget_enabled,
+            enabled: true,
+            command: Command::ToggleWidget,
         });
         items.push(MenuItem::Separator);
         items.push(MenuItem::Action {
@@ -676,6 +700,19 @@ mod backend {
                 ..Default::default()
             }
             .into(),
+            MenuItem::Toggle {
+                label,
+                checked,
+                enabled,
+                command,
+            } => ksni::menu::CheckmarkItem {
+                label: mnemonics(&label),
+                enabled,
+                checked,
+                activate: Box::new(move |model: &mut Model| model.send(command)),
+                ..Default::default()
+            }
+            .into(),
             MenuItem::Separator => ksni::MenuItem::Separator,
         }
     }
@@ -728,7 +765,7 @@ mod backend {
     use std::sync::mpsc::{Receiver, Sender, channel};
     // The shared menu model's own `MenuItem` keeps its name; muda's is spelled out at
     // its uses so the two never blur.
-    use tray_icon::menu::{Menu, MenuEvent, MenuId, PredefinedMenuItem};
+    use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, PredefinedMenuItem};
     use tray_icon::{
         Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
     };
@@ -943,6 +980,23 @@ mod backend {
                     .map_err(|error| Error(error.to_string()))?;
                     ids.insert(id, command);
                 }
+                MenuItem::Toggle {
+                    label,
+                    checked,
+                    enabled,
+                    command,
+                } => {
+                    let id = index.to_string();
+                    menu.append(&CheckMenuItem::with_id(
+                        MenuId(id.clone()),
+                        escape(&label),
+                        enabled,
+                        checked,
+                        None,
+                    ))
+                    .map_err(|error| Error(error.to_string()))?;
+                    ids.insert(id, command);
+                }
                 MenuItem::Separator => menu
                     .append(&PredefinedMenuItem::separator())
                     .map_err(|error| Error(error.to_string()))?,
@@ -996,6 +1050,9 @@ mod backend {
                 .map(|item| match item {
                     super::MenuItem::Caption(label) => format!("caption: {label}"),
                     super::MenuItem::Action { label, .. } => format!("action: {label}"),
+                    super::MenuItem::Toggle { label, checked, .. } => {
+                        format!("toggle: {label}: {checked}")
+                    }
                     super::MenuItem::Separator => "separator".to_owned(),
                 })
                 .collect()
@@ -1010,6 +1067,7 @@ mod backend {
                 }],
                 attention: false,
                 connected: true,
+                widget_enabled: false,
             };
             assert_eq!(
                 labels(&model(state)),
@@ -1018,6 +1076,7 @@ mod backend {
                     "separator",
                     "action: Open Highwater",
                     "action: Refresh now",
+                    "toggle: Desktop widget: false",
                     "separator",
                     "action: Quit",
                 ]
@@ -1033,6 +1092,7 @@ mod backend {
                 }],
                 attention: false,
                 connected: false,
+                widget_enabled: true,
             };
             assert_eq!(
                 labels(&model(state)),
@@ -1041,6 +1101,7 @@ mod backend {
                     "separator",
                     "action: Open Highwater",
                     "action: Refresh now",
+                    "toggle: Desktop widget: true",
                     "separator",
                     "action: Quit",
                 ]
@@ -1056,17 +1117,18 @@ mod backend {
                 .into_iter()
                 .enumerate()
                 .map(|(index, item)| match item {
-                    super::MenuItem::Action { command, .. } => {
+                    super::MenuItem::Action { command, .. }
+                    | super::MenuItem::Toggle { command, .. } => {
                         assert!(
                             ids.contains_key(&index.to_string()),
-                            "every action has an id"
+                            "every action and toggle has an id"
                         );
                         Some(command)
                     }
                     _ => {
                         assert!(
                             !ids.contains_key(&index.to_string()),
-                            "only actions have ids"
+                            "only actions and toggles have ids"
                         );
                         None
                     }
@@ -1160,8 +1222,14 @@ impl Tray {
     }
 
     /// Tells the panel what the interface now knows. Never blocks.
-    pub fn show(&self, statuses: &[ProviderStatus], titles: &model::Titles, connected: bool) {
-        let state = State::of(statuses, titles, connected);
+    pub fn show(
+        &self,
+        statuses: &[ProviderStatus],
+        titles: &model::Titles,
+        connected: bool,
+        widget_enabled: bool,
+    ) {
+        let state = State::of(statuses, titles, connected, widget_enabled);
         if self.shown.borrow().as_ref() == Some(&state) {
             return;
         }

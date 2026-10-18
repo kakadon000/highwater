@@ -40,6 +40,7 @@ mod tray;
 mod tray_icon_rgba;
 mod update;
 mod view;
+mod widget;
 mod window;
 
 // The code slint-build generates from `ui/`, which does not derive Debug.
@@ -51,7 +52,7 @@ use ui::{
     About, Alert, AlertForm, AlertResponse, AppWindow, CandidateData, CardData, DetailData,
     GaugeData, MenuEntry, NoteBlock, OptionData, PickerRowData, Prefs, PreviewRow, ProviderRowData,
     ProviderSettings, QuotaDetailRow, QuotaDetails, QuotaSectionData, QuotaWindowData,
-    ReleaseNotes, RowData, SwitchData, Theme,
+    ReleaseNotes, RowData, SwitchData, Theme, WidgetRow,
 };
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -146,6 +147,12 @@ fn main() -> Result<(), slint::PlatformError> {
             .is_ok();
     #[cfg(not(windows))]
     let composited = false;
+    // The widget floats translucent wherever the window's surface keeps its alpha:
+    // over the composited path on Windows, over the compositor everywhere else.
+    #[cfg(windows)]
+    let widget_translucent = composited;
+    #[cfg(not(windows))]
+    let widget_translucent = true;
     #[cfg(target_os = "linux")]
     let launch = std::cell::RefCell::new(launch);
     let renderer = if composited {
@@ -195,7 +202,7 @@ fn main() -> Result<(), slint::PlatformError> {
     frame::install(&ui);
     about::install(&ui);
     release_notes::install(&ui);
-    let _main = window::MainWindow::start(&ui, renderer, background);
+    let _main = window::MainWindow::start(&ui, renderer, background, widget_translucent);
     #[cfg(unix)]
     if let Some(connection) = &instance
         && let Err(error) = async_io::block_on(application::serve(connection, &ui))
