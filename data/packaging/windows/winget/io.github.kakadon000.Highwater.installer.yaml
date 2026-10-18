@@ -5,12 +5,12 @@
 # Highwater-v<version>-setup.exe asset, and open a PR against
 # microsoft/winget-pkgs.
 PackageIdentifier: io.github.kakadon000.Highwater
-PackageVersion: 0.9.1
+PackageVersion: 0.9.2
 Installers:
   - InstallerLocale: en-US
     Architecture: x64
     InstallerType: inno
-    InstallerUrl: https://github.com/kakadon000/highwater/releases/download/v0.9.1/Highwater-v0.9.1-setup.exe
+    InstallerUrl: https://github.com/kakadon000/highwater/releases/download/v0.9.2/Highwater-v0.9.2-setup.exe
     InstallerSha256: <sha256 of the released setup executable, filled at release time>
     Scope: user
     InstallerSwitches:
