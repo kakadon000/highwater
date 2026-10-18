@@ -56,7 +56,7 @@ fn default_on_top() -> bool {
 }
 
 fn default_opacity() -> i32 {
-    85
+    90
 }
 
 fn default_scale() -> i32 {
@@ -210,17 +210,25 @@ impl WidgetPanel {
         };
         ui.global::<WidgetDesk>().set_connected(connected);
         self.rows.set_vec(rows);
-        // The winit backend sizes a window only when it shows it, and this one
-        // shows before the first readings land: without resizing here the card
-        // clips inside the frame it was created with, and every account added
-        // or removed after keeps the stale frame. The card's own arithmetic
-        // comes back through the window's public functions, so this cannot
-        // drift from what the .slint lays out.
+        self.resize();
+        self.place();
+    }
+
+    /// Sizes the window to what the rows as they stand want. The winit backend
+    /// sizes a window only when it shows it, and this one shows before the
+    /// first readings land: without resizing here the card clips inside the
+    /// frame it was created with, and every account added or removed after
+    /// keeps the stale frame. The card's own arithmetic comes back through the
+    /// window's public functions, so this cannot drift from what the .slint
+    /// lays out.
+    fn resize(&self) {
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
         ui.window().set_size(slint::LogicalSize::new(
             ui.invoke_preferred_window_width(),
             ui.invoke_preferred_window_height(),
         ));
-        self.place();
     }
 
     /// Copies the desktop's dark choice onto this window's own palette, as the
@@ -543,16 +551,25 @@ impl WidgetPanel {
 
     /// The system backdrop behind the card, exactly as the preferences sheet has
     /// it: the documented attribute on Windows 11 22H2+, the composition accent
-    /// below that. Both are idempotent, so every show re-affirms them.
+    /// below that. Both are idempotent, so every show re-affirms them. Where
+    /// neither path takes — no handle, or the system refused — the card gives
+    /// up its translucency and draws opaque: a gadget one cannot see is not a
+    /// gadget, and half a card hanging on a surface that keeps nothing behind
+    /// it is worse than a solid one.
     #[cfg(windows)]
     fn arm_backdrop(&self) {
-        if let Some(ui) = self.ui.upgrade()
-            && ui
-                .window()
+        let armed = self.ui.upgrade().is_some_and(|ui| {
+            ui.window()
                 .with_winit_window(crate::backdrop::attach_window)
-                .is_none()
-        {
-            tracing::warn!("the widget has no Win32 handle; it stays opaque");
+                == Some(true)
+        });
+        if !armed {
+            tracing::info!("no system backdrop; the widget draws opaque");
+            if let Some(ui) = self.ui.upgrade() {
+                ui.global::<WidgetDesk>().set_acrylic(false);
+                ui.global::<WidgetDesk>().set_translucent(false);
+            }
+            self.resize();
         }
     }
 
@@ -611,7 +628,7 @@ mod tests {
         let config = WidgetConfig::default();
         assert!(config.enabled);
         assert!(config.on_top);
-        assert_eq!(config.opacity, 85);
+        assert_eq!(config.opacity, 90);
         assert_eq!(config.scale, 100);
         assert_eq!(config.look(), "auto");
         assert_eq!(config.position, None);

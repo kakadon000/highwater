@@ -47,17 +47,21 @@ const ACCENT_TINT: u32 = 0x59262222;
 
 /// Arms the backdrop on the window the preferences sheet opens in.
 pub fn attach(ui: &AppWindow) {
-    if ui.window().with_winit_window(attach_window).is_none() {
-        tracing::warn!("preferences opened before the window existed; no acrylic");
+    if ui.window().with_winit_window(attach_window) != Some(true) {
+        tracing::warn!(
+            "the preferences sheet stays opaque: no Win32 handle, or the backdrop was refused"
+        );
     }
 }
 
 /// Arms the backdrop on any one winit window: the preferences sheet and the
-/// desktop widget float over the same system acrylic.
-pub fn attach_window(window: &Window) {
+/// desktop widget float over the same system acrylic. True when a backdrop
+/// path took — a false means the surface keeps nothing behind it, and a card
+/// that counts on translucency had better draw opaque instead.
+pub fn attach_window(window: &Window) -> bool {
     let Some(hwnd) = hwnd(window) else {
-        tracing::warn!("the window has no Win32 handle; preferences stay opaque");
-        return;
+        tracing::warn!("the window has no Win32 handle; it stays opaque");
+        return false;
     };
     // SAFETY: DWM attribute writes on a window this process owns. A build older than
     // Windows 11 22H2 rejects the attribute and takes the accent route below instead.
@@ -72,7 +76,9 @@ pub fn attach_window(window: &Window) {
     };
     if armed.is_err() {
         // SAFETY: see `acrylic_behind`.
-        unsafe { acrylic_behind(hwnd) };
+        unsafe { acrylic_behind(hwnd) }
+    } else {
+        true
     }
 }
 
@@ -85,7 +91,7 @@ pub fn attach_window(window: &Window) {
 /// # Safety
 /// A user32 call on a window this process owns, with pointers to stack data the call
 /// copies out before it returns.
-unsafe fn acrylic_behind(hwnd: HWND) {
+unsafe fn acrylic_behind(hwnd: HWND) -> bool {
     #[repr(C)]
     struct AccentPolicy {
         accent_state: u32,
@@ -121,13 +127,13 @@ unsafe fn acrylic_behind(hwnd: HWND) {
     let module = unsafe { GetModuleHandleW(w!("user32.dll")) };
     let Ok(module) = module else {
         tracing::debug!("user32 is not loaded, which a GUI process does not do; stopping");
-        return;
+        return false;
     };
     // SAFETY: a plain export lookup by name.
     let address = unsafe { GetProcAddress(module, s!("SetWindowCompositionAttribute")) };
     let Some(address) = address else {
         tracing::debug!("this user32 has no composition attribute export; staying opaque");
-        return;
+        return false;
     };
     // SAFETY: the address came from GetProcAddress on user32, and the signature is the
     // one the export has shipped with since Windows 10 1507.
@@ -141,7 +147,9 @@ unsafe fn acrylic_behind(hwnd: HWND) {
     // readable all the same.
     if unsafe { set(hwnd, &data) } == 0 {
         tracing::debug!("the Windows 10 accent route refused the acrylic; staying opaque");
+        return false;
     }
+    true
 }
 
 /// The window's Win32 handle, through winit's raw-window-handle bridge.
