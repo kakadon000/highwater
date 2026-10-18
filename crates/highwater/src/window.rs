@@ -133,6 +133,7 @@ fn widget_row(
     let mark = marks.get(&status.provider);
     let has_mark = mark.is_some();
     let mark = mark.unwrap_or_else(no_mark);
+    let percent = |value: f32| format!("{}%", value.round() as i32);
     match card.body {
         Body::Reading(reading) => WidgetRow {
             initial: initial.into(),
@@ -140,6 +141,11 @@ fn widget_row(
             mark,
             has_mark,
             value: reading.headline.into(),
+            percent: reading
+                .gauge
+                .as_ref()
+                .map_or(String::new(), |gauge| percent(gauge.percent as f32))
+                .into(),
             has_gauge: reading.gauge.is_some(),
             gauge_percent: reading
                 .gauge
@@ -158,6 +164,7 @@ fn widget_row(
             mark,
             has_mark,
             value: format!("{whole}{}", fraction.unwrap_or_default()).into(),
+            percent: "".into(),
             has_gauge: false,
             gauge_percent: 0.0,
             gauge_tone: 0,
@@ -169,6 +176,7 @@ fn widget_row(
             mark,
             has_mark,
             value: message.into(),
+            percent: "".into(),
             has_gauge: false,
             gauge_percent: 0.0,
             gauge_tone: 0,
@@ -997,6 +1005,7 @@ impl MainWindow {
                 mark: no_mark(),
                 has_mark: false,
                 value: "Open Highwater".into(),
+                percent: "".into(),
                 has_gauge: false,
                 gauge_percent: 0.0,
                 gauge_tone: 0,
