@@ -1,0 +1,207 @@
+[package]
+name = "highwater"
+description = "Highwater desktop client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# NOTE: this crate must never depend on highwater-core, on an HTTP client, or on a
+# database driver. It talks to highwaterd over D-Bus and speaks only highwater-types.
+# scripts/check-layering.sh enforces this.
+[dependencies]
+# The tray's channel from its own thread to the event loop. Already in the tree under
+# zbus's async-io backend; named here because this crate uses it directly.
+async-channel = "2.5.0"
+async-io = "2.6.0"
+pulldown-cmark = { version = "0.13.4", default-features = false }
+rfd = "0.17.2"
+semver = "1.0.28"
+serde_json = "1.0.151"
+# `~`: the winit accessor behind `unstable-winit-030` may change in any minor release.
+slint = { version = "~1.18.1", features = ["unstable-winit-030"] }
+highwater-ipc = { path = "../highwater-ipc" }
+highwater-types = { path = "../highwater-types" }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+webbrowser = "1.2.4"
+zbus = { version = "5.13.2", features = ["p2p"] }
+
+[target.'cfg(windows)'.dependencies]
+# FemtoVG on Direct3D 12. Linux draws FemtoVG on OpenGL, which Slint builds by default.
+# `unstable-wgpu-30` presents it through DirectComposition, so the window's corners can be
+# transparent; like the winit accessor, it may change in any minor release.
+slint = { version = "~1.18.1", features = ["renderer-femtovg-wgpu", "unstable-wgpu-30"] }
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    # The desktop's light/dark choice and accent colour.
+    "Win32_System_Registry",
+    # SECURITY_ATTRIBUTES on the mutex signature.
+    "Win32_Security",
+    # The kill-on-close job that ties a client-spawned daemon to this process.
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    # The message pump the tray thread runs for tray-icon.
+    "Win32_UI_WindowsAndMessaging",
+] }
+# The Windows tray. tray-icon drives the Win32 tray APIs on a thread of its own; `windows`
+# supplies the message pump that thread must run for menu events to be delivered.
+# Disable unused Linux backends; the Linux tray uses ksni below.
+tray-icon = { version = "0.26.1", default-features = false }
+# AF_UNIX on Windows: std has no sockets there. The daemon serves its p2p endpoint with
+# the same crate.
+uds_windows = "1.2.1"
+
+[target.'cfg(unix)'.dependencies]
+# StatusNotifierItem and com.canonical.dbusmenu. Unlicense (public domain); built on the same
+# zbus 5 and async-io backend this crate already talks to the daemon over.
+ksni = { version = "0.3.6", default-features = false, features = ["async-io"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# A click-through Wayland subsurface for the custom frame's shadow. Bind the
+# existing Winit display through libwayland, still loaded at runtime with dlopen.
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+wayland-client = { version = "0.31.15", features = ["system", "dlopen"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Protocol tests use a socket pair; no display server or GUI is launched.
+wayland-server = "0.31.14"
+
+[build-dependencies]
+slint-build = "1.18.1"
+winresource = "0.1.31"
+
+# The Debian package. It carries binaries from two crates, so it is built from a prior
+# `cargo build --release --workspace` and invoked with `--no-build`. The metadata lives
+# here rather than at the workspace root because a virtual manifest has no [package] to
+# hang it on, which is also why the data files are reached as `../../data/...`.
+#
+# The asset list mirrors package() in PKGBUILD file for file. That function is the
+# definition of what a Highwater package contains; keep the two in step.
+[package.metadata.deb]
+maintainer = "kakadon000 <https://github.com/kakadon000>"
+copyright = "2026 kakadon000"
+license-file = ["../../LICENSE", "0"]
+section = "utils"
+priority = "optional"
+# One line per paragraph: cargo-deb re-wraps this to Debian's control-file width, and a
+# string broken across source lines comes out wrapped twice.
+extended-description = "Highwater tracks how much of each AI provider's rate-limit window is burned, when it resets, and whether the current pace reaches it. A polling daemon runs as a systemd user unit; the desktop interface reads it over D-Bus."
+# $auto is dpkg-shlibdeps over the built ELF, so fontconfig and SQLite are named the way
+# Ubuntu names them rather than the way a hand-written list guesses. The rest are what no
+# ELF scan can reveal: the D-Bus *daemon* is a running service rather than a library either
+# binary links, an icon theme leaves no trace in a binary at all, and the windowing and
+# GPU libraries are loaded with dlopen at startup — xkbcommon and the Wayland client by
+# winit, libEGL by Slint's OpenGL renderer. They match the [package.metadata.generate-rpm.requires]
+# table below, under Debian's names. The X11 libraries are only for an X11 session.
+depends = "$auto, dbus-user-session, hicolor-icon-theme, libxkbcommon0, libwayland-client0, libegl1"
+recommends = "libx11-xcb1, libxcursor1, libxi6, libxrandr2, libxkbcommon-x11-0, xdg-desktop-portal"
+conf-files = ["/etc/xdg/autostart/io.github.kakadon000.Highwater.desktop"]
+maintainer-scripts = "../../data/packaging/deb"
+assets = [
+    ["target/release/highwater", "usr/bin/", "755"],
+    ["target/release/highwaterd", "usr/bin/", "755"],
+    ["target/release/highwaterctl", "usr/bin/", "755"],
+    ["../../data/highwaterd.service", "usr/lib/systemd/user/", "644"],
+    ["../../data/icons/hicolor/16x16/apps/io.github.kakadon000.Highwater.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+    ["../../data/icons/hicolor/22x22/apps/io.github.kakadon000.Highwater.png", "usr/share/icons/hicolor/22x22/apps/", "644"],
+    ["../../data/icons/hicolor/24x24/apps/io.github.kakadon000.Highwater.png", "usr/share/icons/hicolor/24x24/apps/", "644"],
+    ["../../data/icons/hicolor/32x32/apps/io.github.kakadon000.Highwater.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+    ["../../data/icons/hicolor/48x48/apps/io.github.kakadon000.Highwater.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["../../data/icons/hicolor/64x64/apps/io.github.kakadon000.Highwater.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["../../data/icons/hicolor/128x128/apps/io.github.kakadon000.Highwater.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["../../data/icons/hicolor/256x256/apps/io.github.kakadon000.Highwater.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["../../data/icons/hicolor/512x512/apps/io.github.kakadon000.Highwater.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+    ["../../data/icons/hicolor/512x512@2/apps/io.github.kakadon000.Highwater.png", "usr/share/icons/hicolor/512x512@2/apps/", "644"],
+    # These SVGs are their owners' trademarks and are not under this package's licence,
+    # which is why TRADEMARKS.md is installed beside the copyright file. A rebuild that
+    # drops both lines is a supported configuration: a card with no mark is a state the
+    # interface already has.
+    ["../../data/icons/hicolor/symbolic/apps/highwater-*-symbolic.svg", "usr/share/icons/hicolor/symbolic/apps/", "644"],
+    ["../../data/applications/io.github.kakadon000.Highwater.desktop", "usr/share/applications/", "644"],
+    ["../../data/autostart/io.github.kakadon000.Highwater.desktop", "etc/xdg/autostart/", "644"],
+    ["../../data/metainfo/io.github.kakadon000.Highwater.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["../../data/dbus-1/services/io.github.kakadon000.Highwater.Daemon.service", "usr/share/dbus-1/services/", "644"],
+    ["../../data/restart-user-daemon", "usr/lib/highwater/restart-user-daemon", "755"],
+    ["../../data/packaging/message.txt", "usr/lib/highwater/first-run.txt", "644"],
+    ["../../docs/TRADEMARKS.md", "usr/share/doc/highwater/TRADEMARKS.md", "644"],
+    ["../../README.md", "usr/share/doc/highwater/README.md", "644"],
+]
+
+# The RPM. Same shape and the same asset list as [package.metadata.deb] above; the two are
+# separate because the dependency names are, and a single hand-written manifest for both
+# would only look unified.
+#
+# auto-req scans the payload's ELFs *transitively*, not just their DT_NEEDED entries, so
+# the requires list is the build host's whole shared-library closure. Measured on
+# 2026-08-22: built on Arch it asked for libxml2.so.16 and libxcb, which neither binary
+# links and which are Arch's versions of libraries Fedora may number differently. This
+# package is therefore only correct when built on Fedora — not as a principle but because
+# a build anywhere else produces requires the target cannot satisfy.
+# scripts/check-package-deps.sh refuses a result the scan did not populate at all.
+[package.metadata.generate-rpm]
+summary = "Track AI provider quota limits"
+license = "MIT"
+url = "https://github.com/kakadon000/highwater"
+auto-req = "find-requires"
+post_install_script = "../../data/packaging/rpm/post-install.sh"
+post_install_script_prog = ["/bin/sh", "-e"]
+assets = [
+    { source = "target/release/highwater", dest = "/usr/bin/highwater", mode = "755" },
+    { source = "target/release/highwaterd", dest = "/usr/bin/highwaterd", mode = "755" },
+    { source = "target/release/highwaterctl", dest = "/usr/bin/highwaterctl", mode = "755" },
+    { source = "../../data/highwaterd.service", dest = "/usr/lib/systemd/user/highwaterd.service", mode = "644" },
+    { source = "../../data/icons/hicolor/16x16/apps/io.github.kakadon000.Highwater.png", dest = "/usr/share/icons/hicolor/16x16/apps/io.github.kakadon000.Highwater.png", mode = "644" },
+    { source = "../../data/icons/hicolor/22x22/apps/io.github.kakadon000.Highwater.png", dest = "/usr/share/icons/hicolor/22x22/apps/io.github.kakadon000.Highwater.png", mode = "644" },
+    { source = "../../data/icons/hicolor/24x24/apps/io.github.kakadon000.Highwater.png", dest = "/usr/share/icons/hicolor/24x24/apps/io.github.kakadon000.Highwater.png", mode = "644" },
+    { source = "../../data/icons/hicolor/32x32/apps/io.github.kakadon000.Highwater.png", dest = "/usr/share/icons/hicolor/32x32/apps/io.github.kakadon000.Highwater.png", mode = "644" },
+    { source = "../../data/icons/hicolor/48x48/apps/io.github.kakadon000.Highwater.png", dest = "/usr/share/icons/hicolor/48x48/apps/io.github.kakadon000.Highwater.png", mode = "644" },
+    { source = "../../data/icons/hicolor/64x64/apps/io.github.kakadon000.Highwater.png", dest = "/usr/share/icons/hicolor/64x64/apps/io.github.kakadon000.Highwater.png", mode = "644" },
+    { source = "../../data/icons/hicolor/128x128/apps/io.github.kakadon000.Highwater.png", dest = "/usr/share/icons/hicolor/128x128/apps/io.github.kakadon000.Highwater.png", mode = "644" },
+    { source = "../../data/icons/hicolor/256x256/apps/io.github.kakadon000.Highwater.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.kakadon000.Highwater.png", mode = "644" },
+    { source = "../../data/icons/hicolor/512x512/apps/io.github.kakadon000.Highwater.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.github.kakadon000.Highwater.png", mode = "644" },
+    { source = "../../data/icons/hicolor/512x512@2/apps/io.github.kakadon000.Highwater.png", dest = "/usr/share/icons/hicolor/512x512@2/apps/io.github.kakadon000.Highwater.png", mode = "644" },
+    # Their owners' trademarks, not under this package's licence, which is why TRADEMARKS.md
+    # installs beside LICENSE. Dropping both lines stays a supported configuration.
+    { source = "../../data/icons/hicolor/symbolic/apps/highwater-*-symbolic.svg", dest = "/usr/share/icons/hicolor/symbolic/apps/", mode = "644" },
+    { source = "../../data/applications/io.github.kakadon000.Highwater.desktop", dest = "/usr/share/applications/io.github.kakadon000.Highwater.desktop", mode = "644" },
+    { source = "../../data/autostart/io.github.kakadon000.Highwater.desktop", dest = "/etc/xdg/autostart/io.github.kakadon000.Highwater.desktop", mode = "644", config = "noreplace" },
+    { source = "../../data/metainfo/io.github.kakadon000.Highwater.metainfo.xml", dest = "/usr/share/metainfo/io.github.kakadon000.Highwater.metainfo.xml", mode = "644" },
+    { source = "../../data/dbus-1/services/io.github.kakadon000.Highwater.Daemon.service", dest = "/usr/share/dbus-1/services/io.github.kakadon000.Highwater.Daemon.service", mode = "644" },
+    { source = "../../data/restart-user-daemon", dest = "/usr/lib/highwater/restart-user-daemon", mode = "755" },
+    { source = "../../data/packaging/message.txt", dest = "/usr/lib/highwater/first-run.txt", mode = "644" },
+    # The .deb gets these from cargo-deb's own license-file and doc handling; rpm has no
+    # such field, so they are listed.
+    { source = "../../LICENSE", dest = "/usr/share/licenses/highwater/LICENSE", mode = "644", doc = true },
+    { source = "../../docs/TRADEMARKS.md", dest = "/usr/share/licenses/highwater/TRADEMARKS.md", mode = "644", doc = true },
+    { source = "../../README.md", dest = "/usr/share/doc/highwater/README.md", mode = "644", doc = true },
+]
+
+# Not discoverable from the ELF: zbus is pure Rust, so libdbus is never linked, an icon
+# theme leaves no trace in a binary, the windowing and GPU libraries are loaded with
+# dlopen, and the root-owned upgrade script uses runuser to reach each desktop user's
+# systemd manager. Debian's util-linux is Essential; Fedora splits enough of it out that
+# the RPM must require the full package explicitly.
+[package.metadata.generate-rpm.requires]
+dbus-common = "*"
+hicolor-icon-theme = "*"
+libglvnd-egl = "*"
+libwayland-client = "*"
+libxkbcommon = "*"
+util-linux = "*"
+
+# An X11 session's windowing libraries, and the portal the file chooser and the desktop's
+# dark style and accent come through.
+[package.metadata.generate-rpm.recommends]
+libX11-xcb = "*"
+libXcursor = "*"
+libXi = "*"
+libXrandr = "*"
+libxkbcommon-x11 = "*"
+xdg-desktop-portal = "*"

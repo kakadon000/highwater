@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/highwater-types",
+    "crates/highwater-ipc",
+    "crates/highwater-core",
+    "crates/highwaterd",
+    "crates/highwater",
+    "crates/highwater-cli",
+]
+
+[workspace.package]
+version = "0.7.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+repository = "https://github.com/kakadon000/highwater"
+authors = ["kakadon000"]
+
+[workspace.lints.rust]
+# Unsafe stays denied workspace-wide. Native Win32 calls and the borrowed Wayland
+# display bridge need locally audited exceptions in their platform modules;
+# `forbid` cannot be locally overridden, hence `deny`.
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+todo = "warn"
+dbg_macro = "warn"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

@@ -1,0 +1,14 @@
+PackageIdentifier: io.github.kakadon000.Highwater
+PackageVersion: 0.7.0
+PackageLocale: en-US
+Publisher: kakadon000
+PackageName: Highwater
+License: LicenseRef-LICENSE
+ShortDescription: Usage-limit tracker with provider dashboards, tray and toasts.
+Moniker: highwater
+Tags:
+  - monitoring
+  - tray
+  - slint
+ManifestType: defaultLocale
+ManifestVersion: 1.9.0

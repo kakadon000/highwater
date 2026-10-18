@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=io.github.kakadon000.Highwater.Daemon
+Exec=/usr/bin/highwaterd
+SystemdService=highwaterd.service

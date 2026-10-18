@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Highwater
+Comment=Keep AI provider quotas available in the tray
+Exec=highwater --background
+Icon=io.github.kakadon000.Highwater
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

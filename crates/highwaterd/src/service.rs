@@ -1,0 +1,5117 @@
+//! The D-Bus interface, and the state it serves.
+//!
+//! Shaped as if a CLI and a Waybar module were already consuming it, because they will be:
+//! `GetStatus` answers the whole question in one call — every account, its state, its
+//! windows, and when the daemon intends to poll next — so a script can render a bar from a
+//! single round trip without modelling the scheduler. `ProviderChanged` carries the same
+//! shape, so a long-running client never needs a second code path for updates.
+//!
+//! Everything is verifiable with `busctl` before any GUI exists:
+//!
+//! ```sh
+//! busctl --user introspect io.github.kakadon000.Highwater.Daemon /io/github/kakadon000/Highwater
+//! busctl --user call io.github.kakadon000.Highwater.Daemon /io/github/kakadon000/Highwater \
+//!     io.github.kakadon000.Highwater.Daemon1 GetStatus
+//! busctl --user call io.github.kakadon000.Highwater.Daemon /io/github/kakadon000/Highwater \
+//!     io.github.kakadon000.Highwater.Daemon1 Refresh s ""
+//! ```
+//!
+//! # Credentials
+//!
+//! The daemon holds the credentials, so the daemon is what changes them: `SetKey`,
+//! `SignOut`, `SetOption`, and the two halves of a login. Nothing about that is specific to
+//! the GUI — a `busctl` line does the same thing, and so would a `highwater login` — which
+//! is the point of putting it here rather than reachable only through a dialog.
+//!
+//! A login is two calls rather than one because the work splits across two processes.
+//! `BeginLogin` takes the callback port, builds the authorize URL and hands it back
+//! *without* waiting; the caller opens it however its platform opens URLs; `AwaitLogin`
+//! then blocks until the browser has come back and the tokens are stored. The daemon does
+//! not open the browser itself: it is a background service that may have been started
+//! before the session had a display, and asking it to guess how to reach one is how a
+//! login silently fails on a machine with an unusual desktop.
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use highwater_core::config::Config;
+use highwater_core::oauth::Login;
+use highwater_core::providers::Credential;
+use highwater_core::providers::keyed::session;
+use highwater_core::secrets::{Kind, SecretError, Secrets};
+use highwater_types::{
+    AccountId, AuthCandidate, AuthSelection, CredentialKind, DataInfo, HistoryPoint, PluginInfo,
+    Preferences, Presentation, ProviderDefinition, ProviderId, ProviderStatus, ids,
+};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
+use tokio::task::{AbortHandle, JoinHandle};
+use zbus::object_server::SignalEmitter;
+use zbus::{fdo, interface};
+
+use crate::engine::{Command, PluginChange, Preference, stored_kind};
+use crate::peer::{Announcement, PeerHub};
+use crate::registry;
+use crate::startup::Startup;
+
+type AccountKey = (String, String);
+type AccountMutation = Arc<Mutex<()>>;
+
+/// The statuses clients read, in the order the accounts were registered.
+///
+/// One writer — the task draining the engine's updates — and any number of readers, which
+/// is what an `RwLock` is for. The order is stable so a client redrawing a grid does not
+/// have to sort to avoid cards jumping around.
+#[derive(Debug, Clone, Default)]
+pub struct Published(Arc<RwLock<Vec<ProviderStatus>>>);
+
+impl Published {
+    /// Replaces the entry for this account, or appends it the first time it is seen.
+    pub async fn upsert(&self, status: ProviderStatus) {
+        let mut statuses = self.0.write().await;
+        match statuses
+            .iter_mut()
+            .find(|held| held.provider == status.provider && held.account == status.account)
+        {
+            Some(held) => *held = status,
+            None => statuses.push(status),
+        }
+    }
+
+    /// Removes one exact account while preserving the order of every survivor.
+    pub async fn remove(&self, provider: &str, account: &str) -> Option<ProviderStatus> {
+        let mut statuses = self.0.write().await;
+        let index = statuses
+            .iter()
+            .position(|held| held.provider == provider && held.account == account)?;
+        Some(statuses.remove(index))
+    }
+
+    /// Puts the accounts in the complete provider and account order.
+    ///
+    /// Applied to the shared vector rather than left to the next `GetStatus` to sort,
+    /// because there is nothing for a client to sort by: the order is the user's and this
+    /// is where it is kept. An account pair the order does not name keeps its place at the
+    /// end — the sort is stable — so a sequence that has raced a removal leaves survivors
+    /// alone instead of shuffling them.
+    pub async fn reorder(&self, accounts: &[(String, String)]) {
+        self.0.write().await.sort_by_key(|status| {
+            accounts
+                .iter()
+                .position(|(provider, account)| {
+                    provider == &status.provider && account == &status.account
+                })
+                .unwrap_or(accounts.len())
+        });
+    }
+
+    /// Everything currently known.
+    pub async fn all(&self) -> Vec<ProviderStatus> {
+        self.0.read().await.clone()
+    }
+
+    /// One account, by the pair that identifies it.
+    pub async fn find(&self, provider: &str, account: &str) -> Option<ProviderStatus> {
+        self.0
+            .read()
+            .await
+            .iter()
+            .find(|held| held.provider == provider && held.account == account)
+            .cloned()
+    }
+}
+
+/// The newer application release, when a successful check found one, and whether release
+/// checks are on at all.
+///
+/// One lock guards both, so a check that was already running when checks were disabled
+/// can never publish after the disable: the disable and the publication are ordered by
+/// the lock, not by an enabled flag copied before an await. The watch channel in
+/// [`PreferencesRuntime`](struct@crate::service) remains the checker's sleep-and-wake
+/// control; this is the state a client can observe.
+#[derive(Debug, Clone, Default)]
+pub struct PublishedUpdate(Arc<RwLock<UpdateState>>);
+
+/// A published release this daemon is older than, with the release notes GitHub carries
+/// beside the tag.
+///
+/// The notes are Markdown, unrendered: rendering belongs to whichever client shows it,
+/// and a daemon reformatting them would be inventing presentation for a surface it cannot
+/// see. A release published without notes is an empty string rather than an absent field,
+/// so the wire has one shape and a client has one fallback.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Release {
+    pub version: String,
+    pub notes: String,
+}
+
+impl Release {
+    pub fn new(version: impl Into<String>, notes: impl Into<String>) -> Self {
+        Self {
+            version: version.into(),
+            notes: notes.into(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct UpdateState {
+    enabled: bool,
+    release: Option<Release>,
+}
+
+impl PublishedUpdate {
+    /// The D-Bus representation: an empty string means no newer release is known.
+    pub async fn get(&self) -> String {
+        self.0
+            .read()
+            .await
+            .release
+            .as_ref()
+            .map(|release| release.version.clone())
+            .unwrap_or_default()
+    }
+
+    /// The known release's notes, empty when there is no release or it carried none.
+    pub async fn notes(&self) -> String {
+        self.0
+            .read()
+            .await
+            .release
+            .as_ref()
+            .map(|release| release.notes.clone())
+            .unwrap_or_default()
+    }
+
+    /// Switches release checks on or off. Disabling forgets any known release in the
+    /// same write that latches the flag, so nothing published afterwards can bring it
+    /// back. Reports whether clients must be told a known release went away.
+    pub async fn set_enabled(&self, enabled: bool) -> bool {
+        let mut held = self.0.write().await;
+        held.enabled = enabled;
+        !enabled && held.release.take().is_some()
+    }
+
+    /// Applies one finished check and returns the signal payload only when clients need
+    /// one. A result that reaches this after checks were disabled is dropped here, under
+    /// the same lock the disable took.
+    ///
+    /// The version decides whether clients are told, not the notes: GitHub's release body
+    /// is editable after publication, and an author fixing a typo in it is not news for a
+    /// window that is already showing the button. The newer notes are still stored, so the
+    /// next client to ask for them gets the corrected text.
+    pub async fn publish(&self, next: Option<Release>) -> Option<String> {
+        let mut held = self.0.write().await;
+        if !held.enabled {
+            return None;
+        }
+        let announce = held
+            .release
+            .as_ref()
+            .map(|release| release.version.as_str())
+            != next.as_ref().map(|release| release.version.as_str());
+        held.release = next;
+        announce.then(|| {
+            held.release
+                .as_ref()
+                .map(|release| release.version.clone())
+                .unwrap_or_default()
+        })
+    }
+}
+
+/// A login that has been started and not yet finished.
+///
+/// The task owns the listener and the exchange; this is the handle `AwaitLogin` takes to
+/// wait on it and `CancelLogin` uses to let the port go.
+#[derive(Debug)]
+struct Pending {
+    task: Option<JoinHandle<Result<(), String>>>,
+    abort: AbortHandle,
+    identity: Arc<()>,
+}
+
+impl Pending {
+    fn new(task: JoinHandle<Result<(), String>>) -> Self {
+        Self {
+            abort: task.abort_handle(),
+            task: Some(task),
+            identity: Arc::new(()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PreferencesRuntime {
+    config_path: PathBuf,
+    history_path: PathBuf,
+    startup: Arc<dyn Startup>,
+    release_checks: watch::Sender<bool>,
+    release_check_available: bool,
+}
+
+/// The object served at `/io/github/kakadon000/Highwater`.
+///
+/// Arc-shared so every p2p peer connection on Windows serves the *same* state — one
+/// login table, one mutation map — while the interface stays on the concrete [`Daemon`]
+/// value each connection gets (there is no `Arc<I>` blanket interface).
+#[derive(Debug)]
+pub struct DaemonState {
+    statuses: Published,
+    update: PublishedUpdate,
+    /// Behind a lock because installing or removing a plugin changes it while the daemon
+    /// is running: the compiled part never moves, the plugin part does.
+    catalog: RwLock<Vec<ProviderDefinition>>,
+    configured: RwLock<HashSet<AccountKey>>,
+    commands: mpsc::Sender<Command>,
+    /// The daemon runtime, retained because zbus executes p2p method callbacks on
+    /// its own executor rather than inside Tokio's reactor.
+    runtime: tokio::runtime::Handle,
+    secrets: Arc<dyn Secrets>,
+    logins: Mutex<HashMap<AccountKey, Pending>>,
+    mutations: Mutex<HashMap<AccountKey, AccountMutation>>,
+    preferences: Option<PreferencesRuntime>,
+    preference_mutation: Mutex<()>,
+    /// The p2p fan-out, present only where the daemon serves peers directly (Windows).
+    /// `None` keeps the session-bus emitters exactly as they were.
+    hub: Option<Arc<PeerHub>>,
+    /// The icon-theme root installed plugin marks are materialized under, published so a
+    /// client can add it to its own search path. Empty for a daemon with no plugin
+    /// directory, which is what every test that does not name one gets.
+    plugin_icons: PathBuf,
+}
+
+/// The D-Bus interface handle: cloneable, and shared by every p2p peer connection.
+///
+/// The interface itself is implemented on this concrete type — zbus needs a concrete
+/// `Interface`, and the `Arc` inside is what makes per-peer clones one service.
+#[derive(Debug, Clone)]
+pub struct Daemon(Arc<DaemonState>);
+
+impl std::ops::Deref for Daemon {
+    type Target = DaemonState;
+
+    fn deref(&self) -> &DaemonState {
+        &self.0
+    }
+}
+
+impl Daemon {
+    /// Wires the interface to the published state, the poll loop and the keyring.
+    pub fn new(
+        statuses: Published,
+        update: PublishedUpdate,
+        catalog: Vec<ProviderDefinition>,
+        configured: Vec<AccountKey>,
+        commands: mpsc::Sender<Command>,
+        secrets: Arc<dyn Secrets>,
+    ) -> Self {
+        Self(Arc::new(DaemonState::new(
+            statuses, update, catalog, configured, commands, secrets,
+        )))
+    }
+
+    /// Adds the paths and system integrations behind the application preferences API.
+    /// Builders run before the handle is cloned to any peer, while the `Arc` is unique.
+    pub fn with_preferences(
+        self,
+        config_path: PathBuf,
+        history_path: PathBuf,
+        startup: Arc<dyn Startup>,
+        release_checks: watch::Sender<bool>,
+        release_check_available: bool,
+    ) -> Self {
+        let mut this = self;
+        Arc::get_mut(&mut this.0)
+            .expect("the daemon is not shared while it is being built")
+            .preferences = Some(PreferencesRuntime {
+            config_path,
+            history_path,
+            startup,
+            release_checks,
+            release_check_available,
+        });
+        this
+    }
+
+    /// Names the icon-theme root a client adds to find installed plugin marks.
+    ///
+    /// Separate from [`Self::with_preferences`] rather than a seventh argument to it: the
+    /// path is one fact for one client to act on, and every caller that does not have a
+    /// plugin directory would otherwise have to say so.
+    pub fn with_plugin_icons(self, root: PathBuf) -> Self {
+        let mut this = self;
+        Arc::get_mut(&mut this.0)
+            .expect("the daemon is not shared while it is being built")
+            .plugin_icons = root;
+        this
+    }
+
+    /// Routes announcements through the p2p fan-out instead of a session bus.
+    #[cfg(any(windows, test))]
+    pub fn with_hub(self, hub: Arc<PeerHub>) -> Self {
+        let mut this = self;
+        Arc::get_mut(&mut this.0)
+            .expect("the daemon is not shared while it is being built")
+            .hub = Some(hub);
+        this
+    }
+
+    async fn publish_preferences(
+        &self,
+        emitter: &SignalEmitter<'_>,
+        preferences: Preferences,
+    ) -> fdo::Result<()> {
+        match &self.0.hub {
+            // A p2p peer's own emitter only reaches that peer; the hub reaches all of
+            // them, including the caller.
+            Some(hub) => {
+                hub.publish(Announcement::PreferencesChanged(preferences))
+                    .await;
+            }
+            None => Self::preferences_changed(emitter, preferences).await?,
+        }
+        Ok(())
+    }
+
+    /// Sends a plugin request through the engine and names the stage that refused it.
+    ///
+    /// Every plugin failure is the caller's file or the caller's argument, never the
+    /// daemon's state, so they map onto `InvalidArgs` rather than `Failed` — a client can
+    /// then show the message beside the field the user is editing.
+    async fn plugin_request<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<T, String>>) -> Command,
+    ) -> fdo::Result<T> {
+        self.config_request(make)
+            .await
+            .map_err(invalid_plugin_argument)
+    }
+
+    /// Republishes the catalog and announces the installed definitions.
+    ///
+    /// The catalog is replaced before the signal goes out, so a client that reacts to the
+    /// signal by calling `ListProviders` cannot see the old one.
+    async fn apply_plugin_change(
+        &self,
+        emitter: &SignalEmitter<'_>,
+        change: PluginChange,
+    ) -> fdo::Result<()> {
+        *self.catalog.write().await = change.catalog;
+        match &self.0.hub {
+            Some(hub) => {
+                hub.publish(Announcement::PluginsChanged(change.plugins))
+                    .await;
+            }
+            None => Self::plugins_changed(emitter, change.plugins).await?,
+        }
+        Ok(())
+    }
+
+    /// Announces the empty update after a disable, on the hub or the session bus.
+    async fn announce_update_removal(&self, emitter: &SignalEmitter<'_>) -> fdo::Result<()> {
+        match &self.0.hub {
+            Some(hub) => {
+                hub.publish(Announcement::UpdateChanged(String::new()))
+                    .await;
+            }
+            None => Self::update_changed(emitter, "").await?,
+        }
+        Ok(())
+    }
+
+    /// Announces fresh storage facts, on the hub or the session bus.
+    async fn announce_data(&self, emitter: &SignalEmitter<'_>) -> fdo::Result<()> {
+        let data = self.get_data_info().await?;
+        match &self.0.hub {
+            Some(hub) => {
+                hub.publish(Announcement::DataChanged(data)).await;
+            }
+            None => Self::data_changed(emitter, data).await?,
+        }
+        Ok(())
+    }
+}
+
+impl DaemonState {
+    /// Wires the state to the published values, the poll loop and the keyring.
+    fn new(
+        statuses: Published,
+        update: PublishedUpdate,
+        catalog: Vec<ProviderDefinition>,
+        configured: Vec<AccountKey>,
+        commands: mpsc::Sender<Command>,
+        secrets: Arc<dyn Secrets>,
+    ) -> Self {
+        Self {
+            statuses,
+            update,
+            catalog: RwLock::new(catalog),
+            configured: RwLock::new(configured.into_iter().collect()),
+            commands,
+            runtime: tokio::runtime::Handle::current(),
+            secrets,
+            logins: Mutex::new(HashMap::new()),
+            mutations: Mutex::new(HashMap::new()),
+            preferences: None,
+            preference_mutation: Mutex::new(()),
+            hub: None,
+            plugin_icons: PathBuf::new(),
+        }
+    }
+
+    fn preferences_runtime(&self) -> fdo::Result<&PreferencesRuntime> {
+        self.preferences
+            .as_ref()
+            .ok_or_else(|| fdo::Error::Failed("application preferences are unavailable".into()))
+    }
+
+    async fn preference_request(&self, preference: Preference) -> fdo::Result<Preferences> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::SetPreference { preference, reply })
+            .await
+            .map_err(|_| fdo::Error::Failed("the poll loop has stopped".into()))?;
+        answer
+            .await
+            .map_err(|_| fdo::Error::Failed("the poll loop dropped the request".into()))?
+            .map_err(fdo::Error::Failed)
+    }
+
+    async fn change_startup_mode(&self, mode: &str) -> fdo::Result<Preferences> {
+        // The caller holds `preference_mutation` across this whole change and the
+        // `PreferencesChanged` that follows it, so no other mutation can commit between
+        // this one and its publication.
+        if !Preferences::valid_startup(mode) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "unknown startup mode {mode:?}"
+            )));
+        }
+        let runtime = self.preferences_runtime()?;
+        let previous = Config::at(runtime.config_path.clone())
+            .and_then(|config| config.preferences())
+            .map_err(|error| fdo::Error::Failed(error.to_string()))?;
+        if let Err(error) = runtime.startup.set_startup_mode(mode) {
+            if let Err(rollback_error) = runtime.startup.set_startup_mode(&previous.startup_mode) {
+                tracing::error!(%rollback_error, "could not roll back a startup preference");
+            }
+            return Err(fdo::Error::Failed(error));
+        }
+        match self
+            .preference_request(Preference::StartupMode(mode.into()))
+            .await
+        {
+            Ok(preferences) => Ok(preferences),
+            Err(error) => {
+                if let Err(rollback_error) =
+                    runtime.startup.set_startup_mode(&previous.startup_mode)
+                {
+                    tracing::error!(%rollback_error, "could not roll back a startup preference");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// The account named by a call, or the error a client gets for naming one that is not
+    /// there — a typo must be visible rather than silently doing nothing.
+    async fn account(&self, provider: &str, account: &str) -> fdo::Result<ProviderStatus> {
+        if !self
+            .configured
+            .read()
+            .await
+            .contains(&key(provider, account))
+        {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "no account {account} is configured for {provider}"
+            )));
+        }
+        if let Some(status) = self.statuses.find(provider, account).await {
+            return Ok(status);
+        }
+
+        let catalog = self.catalog.read().await;
+        let definition = catalog
+            .iter()
+            .find(|definition| definition.provider == provider)
+            .ok_or_else(|| {
+                fdo::Error::InvalidArgs(format!(
+                    "provider {provider} is not supported by this build"
+                ))
+            })?;
+        let mut status =
+            ProviderStatus::pending(&ProviderId::new(provider), &AccountId::new(account));
+        status.credential = Some(definition.credential.clone());
+        status.credential_hint = Some(definition.credential_hint.clone());
+        status.options = definition.options.clone();
+        // The same label the engine will publish once the first status exists, so a client
+        // does not see a card gain its name part-way through configuring the account.
+        status.account_label =
+            (account != AccountId::default().as_str()).then(|| account.to_owned());
+        Ok(status)
+    }
+
+    /// Whether loaded topology contains any account for this provider.
+    async fn configured_provider(&self, provider: &str) -> bool {
+        self.configured
+            .read()
+            .await
+            .iter()
+            .any(|(configured, _)| configured == provider)
+    }
+
+    /// Tells the poll loop that a credential or a setting changed.
+    async fn reload(&self, provider: &str) -> fdo::Result<()> {
+        self.commands
+            .send(Command::Reload {
+                provider: Some(provider.to_owned()),
+            })
+            .await
+            .map_err(|_| fdo::Error::Failed("the poll loop has stopped".into()))
+    }
+
+    /// Sends a configuration mutation and waits until the poll loop has persisted it.
+    async fn config_request<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<T, String>>) -> Command,
+    ) -> fdo::Result<T> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(make(reply))
+            .await
+            .map_err(|_| fdo::Error::Failed("the poll loop has stopped".into()))?;
+        answer
+            .await
+            .map_err(|_| fdo::Error::Failed("the poll loop dropped the request".into()))?
+            .map_err(fdo::Error::Failed)
+    }
+
+    /// Sends an inspection request through the owning engine task.
+    async fn auth_sources_request(
+        &self,
+        provider: &str,
+        account: &str,
+    ) -> fdo::Result<Vec<AuthCandidate>> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::InspectAuthSources {
+                provider: provider.to_owned(),
+                account: account.to_owned(),
+                reply,
+            })
+            .await
+            .map_err(|_| fdo::Error::Failed("the poll loop has stopped".into()))?;
+        answer
+            .await
+            .map_err(|_| fdo::Error::Failed("the poll loop dropped the request".into()))?
+            .map_err(fdo::Error::Failed)
+    }
+
+    /// The lock serializing credential and topology mutations for one account.
+    async fn mutation(&self, provider: &str, account: &str) -> AccountMutation {
+        Arc::clone(
+            self.mutations
+                .lock()
+                .await
+                .entry(key(provider, account))
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
+    /// Every configured account id of one provider, sorted: the order their mutation
+    /// locks are taken in, so two operations touching the same provider cannot deadlock.
+    async fn provider_accounts(&self, provider: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .configured
+            .read()
+            .await
+            .iter()
+            .filter(|(configured, _)| configured == provider)
+            .map(|(_, account)| account.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Takes every account mutation lock of one provider, in sorted id order, and holds
+    /// them for an identity migration.
+    async fn lock_provider_identities<'a>(&'a self, provider: &'a str) -> IdentityMigration<'a> {
+        loop {
+            let ids = self.provider_accounts(provider).await;
+            let mut guards = Vec::with_capacity(ids.len());
+            for id in &ids {
+                // Owned guards, so the lock's `Arc` lives exactly as long as the guard —
+                // one per account, all held until the migration has finished.
+                let mutation = self.mutation(provider, id).await;
+                guards.push(mutation.lock_owned().await);
+            }
+            if self.provider_accounts(provider).await == ids {
+                return IdentityMigration {
+                    daemon: self,
+                    provider,
+                    ids,
+                    _guards: guards,
+                };
+            }
+        }
+    }
+
+    /// Removes and aborts a pending login, if one exists.
+    async fn cancel_pending_login(&self, provider: &str, account: &str) {
+        if let Some(mut pending) = self.logins.lock().await.remove(&key(provider, account)) {
+            pending.abort.abort();
+            if let Some(task) = pending.task.take() {
+                let _ = task.await;
+            } else {
+                while !pending.abort.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            }
+            tracing::info!(provider, account, "login cancelled");
+        }
+    }
+}
+
+/// Every account mutation lock of one provider, held across an identity migration.
+///
+/// A rename or a promotion rekeys credential slots by id, and a credential written to
+/// any of the provider's ids while that is in flight is the write it would lose: the
+/// whole provider's ids are held, taken in sorted order so two such flows cannot
+/// deadlock. The id set is re-read once the guards are held and the attempt restarted
+/// if it moved — an account added while the locks were being taken must join the guard,
+/// not escape it.
+///
+/// The same holder carries the migration's epilogue: the engine's reply is the topology,
+/// and the service's mirror of it — the set every call validates ids against — is
+/// rebuilt from that answer rather than guessed at, because the published copy is
+/// updated asynchronously.
+struct IdentityMigration<'a> {
+    daemon: &'a DaemonState,
+    provider: &'a str,
+    /// The ids the guards cover, in the sorted order their locks were taken in.
+    ids: Vec<String>,
+    /// One owned guard per id, held until the migration has finished. Underscored
+    /// because holding them is their whole job.
+    _guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+/// The D-Bus error a keyring failure becomes.
+///
+/// A locked keyring is the one that matters: it is not the caller's mistake and not a
+/// permanent failure, so it says what to do rather than reporting a fault.
+fn keyring_error(error: SecretError) -> fdo::Error {
+    match error {
+        SecretError::Locked => {
+            fdo::Error::Failed("the keyring is locked; unlock it and try again".into())
+        }
+        other => fdo::Error::Failed(other.to_string()),
+    }
+}
+
+impl IdentityMigration<'_> {
+    /// Replaces this provider's configured pairs with the ones the engine's reply named.
+    ///
+    /// Only this provider's pairs move, under one guard: the reply is a snapshot of
+    /// every provider taken when the engine handled the command, and an add for a
+    /// different provider that completes meanwhile would be wiped out by a whole-set
+    /// replacement. Rebuilding the whole provider's set at once keeps a migration's
+    /// renames — the survivor's new id and the death of its old one — from
+    /// desynchronizing the validation every call depends on.
+    async fn reconcile(&self, topology: &[(String, String)]) {
+        let mut configured = self.daemon.configured.write().await;
+        configured.retain(|(held, _)| held != self.provider);
+        configured.extend(
+            topology
+                .iter()
+                .filter(|(held, _)| held == self.provider)
+                .cloned(),
+        );
+    }
+}
+
+/// Commits the completed OAuth document under the same account mutation guard as sign-out
+/// and removal. Discovery and token exchange happen before this short critical section.
+async fn commit_login(
+    secrets: &dyn Secrets,
+    mutation: &AccountMutation,
+    provider: &str,
+    account: &str,
+    document: &Credential,
+) -> Result<(), SecretError> {
+    let _guard = mutation.lock().await;
+    secrets
+        .set(
+            Kind::Token,
+            &ProviderId::new(provider),
+            &AccountId::new(account),
+            document,
+        )
+        .await
+}
+
+#[interface(name = "io.github.kakadon000.Highwater.Daemon1")]
+impl Daemon {
+    /// Every provider this build knows how to configure.
+    async fn list_providers(&self) -> Vec<ProviderDefinition> {
+        self.catalog.read().await.clone()
+    }
+
+    /// Adds a compiled-in provider's default account and waits for it to be persisted.
+    async fn add_provider(&self, provider: &str) -> fdo::Result<()> {
+        let mutation = self.mutation(provider, AccountId::default().as_str()).await;
+        let _guard = mutation.lock().await;
+        if !self
+            .catalog
+            .read()
+            .await
+            .iter()
+            .any(|definition| definition.provider == provider)
+        {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "provider {provider} is not supported by this build"
+            )));
+        }
+        self.config_request(|reply| Command::AddProvider {
+            provider: provider.to_owned(),
+            reply,
+        })
+        .await?;
+        self.configured
+            .write()
+            .await
+            .insert(key(provider, AccountId::default().as_str()));
+        Ok(())
+    }
+
+    /// Removes one configured account, promoting the first survivor when it was the
+    /// default.
+    ///
+    /// Nothing is deleted from the keyring until the engine has persisted the removal: a
+    /// promotion can still fail after this point — a rekey collision, a history error, a
+    /// config write — and a topology that survives while its credentials are gone is the
+    /// one loss this file must never cause. Cleanup after success is identity-aware: a
+    /// promotion moves the survivor into the `default` slot and rekeys its credential
+    /// inside the engine, so the service deletes only for an id the answer shows is gone.
+    async fn remove_provider(&self, provider: &str, account: &str) -> fdo::Result<()> {
+        let migration = self.lock_provider_identities(provider).await;
+        self.account(provider, account).await?;
+
+        // A login in flight for an id a promotion is about to rename would finish by
+        // storing a token under an id no configured account reads, so every pending
+        // login of the provider goes before the command — not just the target's.
+        if account == AccountId::default().as_str() && migration.ids.len() > 1 {
+            for id in &migration.ids {
+                self.cancel_pending_login(provider, id).await;
+            }
+        } else {
+            self.cancel_pending_login(provider, account).await;
+        }
+
+        let topology = self
+            .config_request(|reply| Command::RemoveProvider {
+                provider: provider.to_owned(),
+                account: account.to_owned(),
+                reply,
+            })
+            .await?;
+
+        // The same net for logins that started against an id the finished removal turns
+        // out not to have kept: the engine's answer, not the caller's intent, says which
+        // identities still exist.
+        let stranded: Vec<String> = self
+            .logins
+            .lock()
+            .await
+            .keys()
+            .filter(|(login_provider, id)| {
+                login_provider == provider && !topology.contains(&(provider.to_owned(), id.clone()))
+            })
+            .map(|(_, id)| id.clone())
+            .collect();
+        for id in stranded {
+            self.cancel_pending_login(provider, &id).await;
+        }
+
+        // Only now that the removal is durable, and only for an id nothing moved into: a
+        // promotion leaves the survivor living under `default`, and deleting there would
+        // take its credential. Every kind is attempted so one locked keyring leaves at
+        // most one residue rather than skipping the kinds behind it.
+        let provider_id = ProviderId::new(provider);
+        let account_id = AccountId::new(account);
+        let promoted = account == AccountId::default().as_str()
+            && topology.iter().any(|(held, _)| held == provider);
+        let mut cleanup = None;
+        if !promoted {
+            for kind in Kind::ALL {
+                if let Err(error) = self.secrets.delete(kind, &provider_id, &account_id).await {
+                    cleanup.get_or_insert(keyring_error(error));
+                }
+            }
+        }
+
+        // The engine's answer is the topology; the published mirror of it is updated by a
+        // separate task and can lag this reply, so it must not be guessed at.
+        migration.reconcile(&topology).await;
+
+        match cleanup {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Adds one more account to a provider this build knows and the config already has,
+    /// and waits for it to be persisted.
+    ///
+    /// The id is checked here for the same reason the provider slug is: an id config can
+    /// never hold should fail as an argument error, not as an engine failure after a
+    /// round trip. Whether the provider supports a second account at all is the engine's
+    /// to answer — that is a property of the provider, not of the argument.
+    async fn add_account(&self, provider: &str, account: &str) -> fdo::Result<()> {
+        let mutation = self.mutation(provider, account).await;
+        let _guard = mutation.lock().await;
+        if !self
+            .catalog
+            .read()
+            .await
+            .iter()
+            .any(|definition| definition.provider == provider)
+        {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "provider {provider} is not supported by this build"
+            )));
+        }
+        if !crate::engine::valid_account_id(account) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "account {account:?} is not a valid account id: letters, digits, spaces, \
+                 hyphens and underscores, beginning and ending on a letter or a digit"
+            )));
+        }
+        if self
+            .configured
+            .read()
+            .await
+            .contains(&key(provider, account))
+        {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "account {provider}/{account} is already configured"
+            )));
+        }
+
+        self.config_request(|reply| Command::AddAccount {
+            provider: provider.to_owned(),
+            account: account.to_owned(),
+            reply,
+        })
+        .await?;
+        self.configured.write().await.insert(key(provider, account));
+        Ok(())
+    }
+
+    /// Renames one configured account, carrying its credential and history to the new id.
+    ///
+    /// The engine migrates them durability-first — the credential is copied before
+    /// anything is deleted, and the old slots go only once the new topology is on disk —
+    /// so a failure anywhere before that point leaves the old id exactly as it was. The
+    /// new id is validated here for the same reason `add_account` validates its own: an
+    /// id the config can never hold is an argument error, not an engine failure after a
+    /// round trip.
+    async fn rename_account(&self, provider: &str, account: &str, new: &str) -> fdo::Result<()> {
+        let migration = self.lock_provider_identities(provider).await;
+        self.account(provider, account).await?;
+        if account == AccountId::default().as_str() {
+            return Err(fdo::Error::InvalidArgs(
+                "the default account is the provider's structural first account and \n                 cannot be renamed"
+                    .into(),
+            ));
+        }
+        if new == account {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "account {provider}/{new} is already named that"
+            )));
+        }
+        if !crate::engine::valid_account_id(new) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "account {new:?} is not a valid account id: letters, digits, spaces, \
+                 hyphens and underscores, beginning and ending on a letter or a digit"
+            )));
+        }
+        if self.configured.read().await.contains(&key(provider, new)) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "account {provider}/{new} is already configured"
+            )));
+        }
+
+        // A login in flight for the id the rename retires would finish by storing a
+        // token under an id no configured account reads. The new id cannot have one:
+        // nothing validates a login against an unconfigured id.
+        self.cancel_pending_login(provider, account).await;
+
+        let topology = self
+            .config_request(|reply| Command::RenameAccount {
+                provider: provider.to_owned(),
+                account: account.to_owned(),
+                new: new.to_owned(),
+                reply,
+            })
+            .await?;
+
+        // The engine's answer is the topology; the published mirror of it is updated by
+        // a separate task and can lag this reply, so it must not be guessed at.
+        migration.reconcile(&topology).await;
+        Ok(())
+    }
+
+    /// Puts one provider's accounts in the order a client's user arranged them in.
+    ///
+    /// The same contract as `SetOrder`, one level down: the list must name every
+    /// configured account of the provider exactly once, because the order and the set it
+    /// reorders live in the same `accounts` array. Whether the default account must lead
+    /// is the engine's rule — the engine is what rewrites the file — so a client that
+    /// gets it wrong hears it from the source of truth rather than from a copy of the
+    /// rule here.
+    async fn set_account_order(&self, provider: &str, accounts: Vec<String>) -> fdo::Result<()> {
+        let mut held = self.provider_accounts(provider).await;
+        let mut wanted = accounts.clone();
+        wanted.sort_unstable();
+        wanted.dedup();
+        held.sort_unstable();
+        if wanted.len() != accounts.len() || wanted != held {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "the order must name every configured account of {provider} exactly once"
+            )));
+        }
+
+        self.config_request(|reply| Command::SetAccountOrder {
+            provider: provider.to_owned(),
+            accounts: accounts.clone(),
+            reply,
+        })
+        .await?;
+        tracing::info!(provider, ?accounts, "account order changed");
+        Ok(())
+    }
+
+    /// Every account the daemon watches, with its current state and last good reading.
+    ///
+    /// Never empty while accounts are configured: they are published as `pending` before
+    /// the first poll, so a client can tell "nothing configured" from "nothing yet".
+    async fn get_status(&self) -> Vec<ProviderStatus> {
+        self.statuses.all().await
+    }
+
+    /// The newer published application release, or an empty string when none is known.
+    async fn get_update(&self) -> String {
+        self.update.get().await
+    }
+
+    /// The known release's notes as GitHub published them — Markdown, unrendered — or an
+    /// empty string when no newer release is known or that release carried none.
+    ///
+    /// Separate from `GetUpdate` and asked for on demand: a client needs the version to
+    /// decide whether to offer anything at all, and the notes only once a user asks to
+    /// read them.
+    async fn get_release_notes(&self) -> String {
+        self.update.notes().await
+    }
+
+    /// Application-wide preferences persisted in `config.toml`.
+    async fn get_preferences(&self) -> fdo::Result<Preferences> {
+        let runtime = self.preferences_runtime()?;
+        Config::at(runtime.config_path.clone())
+            .and_then(|config| config.preferences())
+            .map_err(|error| fdo::Error::Failed(error.to_string()))
+    }
+
+    /// Paths and storage facts for the Preferences data page.
+    async fn get_data_info(&self) -> fdo::Result<DataInfo> {
+        let runtime = self.preferences_runtime()?;
+        let mut wal = runtime.history_path.as_os_str().to_os_string();
+        wal.push("-wal");
+        Ok(DataInfo {
+            config_path: runtime.config_path.to_string_lossy().into_owned(),
+            history_path: runtime.history_path.to_string_lossy().into_owned(),
+            history_bytes: file_size(&runtime.history_path) + file_size(PathBuf::from(wal)),
+            key_schema: ids::SECRET_SCHEMA.into(),
+            token_schema: ids::TOKEN_SCHEMA.into(),
+            release_check_available: runtime.release_check_available,
+            plugin_icons_path: self.plugin_icons.to_string_lossy().into_owned(),
+        })
+    }
+
+    /// Stored points in the open segment of one window.
+    ///
+    /// The service only validates and relays this request. `Engine` owns the SQLite
+    /// connection, so the query shares its serial command queue with writes and polling.
+    async fn current_segment(
+        &self,
+        provider: &str,
+        account: &str,
+        window: &str,
+    ) -> fdo::Result<Vec<HistoryPoint>> {
+        self.account(provider, account).await?;
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::CurrentSegment {
+                provider: provider.to_owned(),
+                account: account.to_owned(),
+                window: window.to_owned(),
+                reply,
+            })
+            .await
+            .map_err(|_| fdo::Error::Failed("the poll loop has stopped".into()))?;
+        answer
+            .await
+            .map_err(|_| fdo::Error::Failed("the poll loop dropped the request".into()))?
+            .map_err(fdo::Error::Failed)
+    }
+
+    /// Polls now: one provider by slug, or every account when given an empty string.
+    ///
+    /// The credential is read again as part of this, so it is also the call the settings
+    /// dialog makes after storing a new key.
+    async fn refresh(&self, provider: &str) -> fdo::Result<()> {
+        let target = (!provider.is_empty()).then(|| provider.to_owned());
+        if let Some(slug) = target.as_deref()
+            && !self.configured_provider(slug).await
+        {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "no account is configured for provider {slug}"
+            )));
+        }
+        self.commands
+            .send(Command::Refresh(target))
+            .await
+            .map_err(|_| fdo::Error::Failed("the poll loop has stopped".into()))
+    }
+
+    /// Brings the running window forward: files `ActivateRequested` with the peer
+    /// fan-out, so the visible client presents itself. The caller — a second UI
+    /// instance — exits straight after this call. Without a fan-out (the session-bus
+    /// platforms, where the toolkit already single-instances) there is nobody to
+    /// tell, and success is still the honest answer: activation is best-effort.
+    async fn request_activate(&self) -> fdo::Result<()> {
+        #[cfg(any(windows, test))]
+        if let Some(hub) = &self.hub {
+            hub.publish(Announcement::ActivateRequested).await;
+        }
+        Ok(())
+    }
+
+    /// Stores an API key for an account, and polls it straight away.
+    ///
+    /// The key is not validated here beyond being non-blank: the only authority on whether
+    /// a key works is the provider, and the poll this triggers is what asks it. A bad key
+    /// arrives back as `credential-rejected`, which is a state the interface already draws.
+    async fn set_key(&self, provider: &str, account: &str, key: &str) -> fdo::Result<()> {
+        tracing::info!(provider, account, "set_key called");
+        let mutation = self.mutation(provider, account).await;
+        let _guard = mutation.lock().await;
+        let status = self.account(provider, account).await?;
+        if status.credential_kind() != Some(CredentialKind::Key) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "{provider} does not take an API key"
+            )));
+        }
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(fdo::Error::InvalidArgs(
+                "an empty key is not a key; use SignOut to remove one".into(),
+            ));
+        }
+        self.secrets
+            .set(
+                Kind::Key,
+                &ProviderId::new(provider),
+                &AccountId::new(account),
+                &Credential::new(key),
+            )
+            .await
+            .map_err(keyring_error)?;
+        tracing::info!(provider, account, "stored an API key");
+        self.reload(provider).await
+    }
+
+    /// Stores a browser session the person pasted in, and puts the account on it.
+    ///
+    /// The fallback for a browser profile this machine will not let Highwater open — since
+    /// Chrome M127, every Chromium profile on Windows. Like `SetKey`, the header is not
+    /// validated here beyond being non-blank: the provider is the only authority on
+    /// whether a session works, and the poll this triggers is what asks it. An expired
+    /// paste arrives back as `credential-rejected`, which the interface already draws.
+    async fn set_session(&self, provider: &str, account: &str, session: &str) -> fdo::Result<()> {
+        tracing::info!(provider, account, "set_session called");
+        let mutation = self.mutation(provider, account).await;
+        let _guard = mutation.lock().await;
+        self.account(provider, account).await?;
+        if !registry::has_pasted_session_auth(provider) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "{provider} does not take a pasted browser session"
+            )));
+        }
+        let session = session.trim();
+        if session.is_empty() {
+            return Err(fdo::Error::InvalidArgs(
+                "an empty session is not a session; select another source to stop using one".into(),
+            ));
+        }
+        self.secrets
+            .set(
+                Kind::Session,
+                &ProviderId::new(provider),
+                &AccountId::new(account),
+                &Credential::new(session),
+            )
+            .await
+            .map_err(keyring_error)?;
+        tracing::info!(provider, account, "stored a pasted browser session");
+        // Storing it is only half the change: an account still pointing at a browser would
+        // go on reading that browser. The selection write is what puts it on the paste, and
+        // it clears the browser fields on its way in.
+        self.config_request(|reply| Command::SelectAuthSource {
+            provider: provider.to_owned(),
+            account: account.to_owned(),
+            selection: AuthSelection {
+                mode: session::PASTE_SOURCE.to_owned(),
+                candidate: None,
+            },
+            reply,
+        })
+        .await
+    }
+
+    /// Removes whatever credential Highwater holds for an account.
+    ///
+    /// For an OAuth provider this hands the account back to the vendor CLI's own login if
+    /// there is one, which is why it is "sign out of Highwater" rather than "sign out": the
+    /// card may well go on working, from the credential it was reading before.
+    async fn sign_out(&self, provider: &str, account: &str) -> fdo::Result<()> {
+        let mutation = self.mutation(provider, account).await;
+        let _guard = mutation.lock().await;
+        let status = self.account(provider, account).await?;
+        let Some(kind) = status.credential_kind().and_then(stored_kind) else {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "Highwater holds no credential for {provider}"
+            )));
+        };
+        self.secrets
+            .delete(kind, &ProviderId::new(provider), &AccountId::new(account))
+            .await
+            .map_err(keyring_error)?;
+        tracing::info!(provider, account, "removed the stored credential");
+        self.reload(provider).await
+    }
+
+    /// Starts a login and returns the URL to open in a browser.
+    ///
+    /// Returns as soon as the callback port is held and the URL exists. Nothing has been
+    /// waited for yet: call `AwaitLogin` for that. A login already in progress for this
+    /// account is replaced, so a user who abandoned a browser tab is not locked out of
+    /// starting again.
+    async fn begin_login(&self, provider: &str, account: &str) -> fdo::Result<String> {
+        let mutation = self.mutation(provider, account).await;
+        let _guard = mutation.lock().await;
+        let status = self.account(provider, account).await?;
+        if status.credential_kind() != Some(CredentialKind::OAuth) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "{provider} does not sign in through Highwater"
+            )));
+        }
+        let client = registry::oauth_client(provider).ok_or_else(|| {
+            fdo::Error::Failed(format!("this build has no OAuth client for {provider}"))
+        })?;
+
+        self.cancel_pending_login(provider, account).await;
+
+        // The zbus p2p executor that calls this method is not a Tokio runtime. The
+        // loopback listener is Tokio I/O, so create it on the daemon's runtime before
+        // replying with the browser URL.
+        let login = self
+            .runtime
+            .spawn(Login::begin(client))
+            .await
+            .map_err(|error| fdo::Error::Failed(format!("OAuth login task stopped: {error}")))?
+            .map_err(|error| fdo::Error::Failed(error.to_string()))?;
+        let url = login.url().to_owned();
+
+        let secrets = Arc::clone(&self.secrets);
+        let commands = self.commands.clone();
+        let provider_name = provider.to_owned();
+        let account_name = account.to_owned();
+        let credential_mutation = Arc::clone(&mutation);
+        let task = self.runtime.spawn(async move {
+            let http = highwater_core::oauth::client().map_err(|error| error.to_string())?;
+            let response = login
+                .finish(&http)
+                .await
+                .map_err(|error| error.to_string())?;
+            let now_ms = highwater_types::Timestamp::now()
+                .as_unix()
+                .saturating_mul(1_000);
+            let document = registry::login_document(&provider_name, &response, now_ms)
+                .await
+                .map_err(|error| error.to_string())?;
+            commit_login(
+                secrets.as_ref(),
+                &credential_mutation,
+                &provider_name,
+                &account_name,
+                &Credential::new(document.to_string()),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            tracing::info!(provider = %provider_name, "signed in");
+            let _ = commands
+                .send(Command::Reload {
+                    provider: Some(provider_name),
+                })
+                .await;
+            Ok(())
+        });
+        self.logins
+            .lock()
+            .await
+            .insert(key(provider, account), Pending::new(task));
+        Ok(url)
+    }
+
+    /// Waits for a login started by `BeginLogin` to finish.
+    ///
+    /// Long-running by design — up to the browser timeout — and there is no D-Bus timeout
+    /// on our side to shorten it. Returns when the tokens are stored, or an error saying
+    /// what went wrong instead.
+    async fn await_login(&self, provider: &str, account: &str) -> fdo::Result<()> {
+        let (task, identity) = {
+            let mut logins = self.logins.lock().await;
+            let pending = logins
+                .get_mut(&key(provider, account))
+                .ok_or_else(|| fdo::Error::Failed("no login is in progress".into()))?;
+            let task = pending
+                .task
+                .take()
+                .ok_or_else(|| fdo::Error::Failed("the login is already being awaited".into()))?;
+            (task, Arc::clone(&pending.identity))
+        };
+        let result = match task.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => Err(fdo::Error::Failed(reason)),
+            Err(error) if error.is_cancelled() => {
+                Err(fdo::Error::Failed("the login was cancelled".into()))
+            }
+            Err(error) => Err(fdo::Error::Failed(error.to_string())),
+        };
+        let login_key = key(provider, account);
+        let mut logins = self.logins.lock().await;
+        if logins
+            .get(&login_key)
+            .is_some_and(|pending| Arc::ptr_eq(&pending.identity, &identity))
+        {
+            logins.remove(&login_key);
+        }
+        result
+    }
+
+    /// Abandons a login in progress and gives the callback port back.
+    ///
+    /// Not an error when there is nothing to cancel: a client that closed its dialog should
+    /// not have to know whether the login had already finished.
+    async fn cancel_login(&self, provider: &str, account: &str) -> fdo::Result<()> {
+        let mutation = self.mutation(provider, account).await;
+        let _guard = mutation.lock().await;
+        self.cancel_pending_login(provider, account).await;
+        Ok(())
+    }
+
+    /// Changes one of a provider's settings and polls it again.
+    ///
+    /// The value is checked against the choices the account publishes, so a client cannot
+    /// write something into `config.toml` that no build knows how to read.
+    async fn set_option(
+        &self,
+        provider: &str,
+        account: &str,
+        name: &str,
+        value: &str,
+    ) -> fdo::Result<()> {
+        let mutation = self.mutation(provider, account).await;
+        let _guard = mutation.lock().await;
+        let status = self.account(provider, account).await?;
+        let option = status
+            .options
+            .iter()
+            .find(|option| option.name == name)
+            .ok_or_else(|| {
+                fdo::Error::InvalidArgs(format!("{provider} has no setting called {name}"))
+            })?;
+        if !option.choices.iter().any(|choice| choice.value == value) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "{value} is not one of the values {name} can take"
+            )));
+        }
+
+        self.config_request(|reply| Command::SetOption {
+            provider: provider.to_owned(),
+            account: account.to_owned(),
+            name: name.to_owned(),
+            value: value.to_owned(),
+            reply,
+        })
+        .await?;
+        tracing::info!(provider, name, value, "setting changed");
+        Ok(())
+    }
+
+    /// Inspects the secret-free local authentication sources an account can select.
+    async fn get_auth_sources(
+        &self,
+        provider: &str,
+        account: &str,
+    ) -> fdo::Result<Vec<AuthCandidate>> {
+        self.account(provider, account).await?;
+        self.auth_sources_request(provider, account).await
+    }
+
+    /// Validates and persists one explicit authentication source.
+    async fn select_auth_source(
+        &self,
+        provider: &str,
+        account: &str,
+        selection: AuthSelection,
+    ) -> fdo::Result<()> {
+        let mutation = self.mutation(provider, account).await;
+        let _guard = mutation.lock().await;
+        self.account(provider, account).await?;
+        self.config_request(|reply| Command::SelectAuthSource {
+            provider: provider.to_owned(),
+            account: account.to_owned(),
+            selection,
+            reply,
+        })
+        .await
+    }
+
+    /// Switches one window's notifications on or off.
+    ///
+    /// Per window rather than per provider, and off by default: the five providers report
+    /// fifteen windows between them, and a warning about every one of them is a warning
+    /// about none. The engine validates the window against what the account currently
+    /// reports and owns the write, so this is the same serialized configuration
+    /// transaction as `SetOption`.
+    async fn set_window_notify(
+        &self,
+        provider: &str,
+        account: &str,
+        window: &str,
+        enabled: bool,
+    ) -> fdo::Result<()> {
+        let mutation = self.mutation(provider, account).await;
+        let _guard = mutation.lock().await;
+        self.account(provider, account).await?;
+
+        self.config_request(|reply| Command::SetWindowNotify {
+            provider: provider.to_owned(),
+            account: account.to_owned(),
+            window: window.to_owned(),
+            enabled,
+            reply,
+        })
+        .await?;
+        tracing::info!(provider, window, enabled, "notification switch changed");
+        Ok(())
+    }
+
+    /// Enables or disables the daemon's GitHub release checks.
+    async fn set_release_check(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        enabled: bool,
+    ) -> fdo::Result<()> {
+        let _guard = self.preference_mutation.lock().await;
+        let runtime = self.preferences_runtime()?;
+        if enabled && !runtime.release_check_available {
+            return Err(fdo::Error::NotSupported(
+                "this build has no release checker".into(),
+            ));
+        }
+        let preferences = self
+            .preference_request(Preference::ReleaseCheck(enabled))
+            .await?;
+        let release_forgotten = self.update.set_enabled(enabled).await;
+        runtime.release_checks.send_replace(enabled);
+        if release_forgotten {
+            self.announce_update_removal(&emitter).await?;
+        }
+        self.publish_preferences(&emitter, preferences).await
+    }
+
+    /// Chooses whether close hides a window that has a working tray icon.
+    async fn set_minimize_on_close(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        enabled: bool,
+    ) -> fdo::Result<()> {
+        let _guard = self.preference_mutation.lock().await;
+        let preferences = self
+            .preference_request(Preference::MinimizeOnClose(enabled))
+            .await?;
+        self.publish_preferences(&emitter, preferences).await
+    }
+
+    /// Chooses whether the client follows the system appearance or forces a theme.
+    async fn set_theme(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        theme: &str,
+    ) -> fdo::Result<()> {
+        if !Preferences::valid_theme(theme) {
+            return Err(fdo::Error::InvalidArgs(format!("unknown theme {theme:?}")));
+        }
+        let _guard = self.preference_mutation.lock().await;
+        let preferences = self
+            .preference_request(Preference::Theme(theme.into()))
+            .await?;
+        self.publish_preferences(&emitter, preferences).await
+    }
+
+    /// Chooses the one coherent login-start mode: app, daemon only, or off.
+    async fn set_startup_mode(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        mode: &str,
+    ) -> fdo::Result<()> {
+        // One lock spans the change, the engine round trip and the publication: releasing
+        // it between the commit and the signal would let a later mutation publish first
+        // and clients see an older snapshot after a newer one.
+        let _guard = self.preference_mutation.lock().await;
+        let preferences = self.change_startup_mode(mode).await?;
+        self.publish_preferences(&emitter, preferences).await
+    }
+
+    /// Sets the named history retention policy and prunes old rows immediately.
+    async fn set_history_retention(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        retention: &str,
+    ) -> fdo::Result<()> {
+        if !Preferences::valid_retention(retention) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "unknown history retention {retention:?}"
+            )));
+        }
+        let _guard = self.preference_mutation.lock().await;
+        let preferences = self
+            .preference_request(Preference::HistoryRetention(retention.into()))
+            .await?;
+        self.publish_preferences(&emitter, preferences).await
+    }
+
+    /// Chooses how the daemon paces healthy accounts: by quota zone, or one fixed interval.
+    async fn set_refresh_mode(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        mode: &str,
+    ) -> fdo::Result<()> {
+        if !Preferences::valid_refresh_mode(mode) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "unknown refresh mode {mode:?}"
+            )));
+        }
+        let _guard = self.preference_mutation.lock().await;
+        let preferences = self
+            .preference_request(Preference::RefreshMode(mode.into()))
+            .await?;
+        self.publish_preferences(&emitter, preferences).await
+    }
+
+    /// Sets the fixed interval Manual mode polls at, in minutes.
+    async fn set_refresh_minutes(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        minutes: u32,
+    ) -> fdo::Result<()> {
+        if !Preferences::valid_refresh_minutes(minutes) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "refresh minutes must be 1 to 120, not {minutes}"
+            )));
+        }
+        let _guard = self.preference_mutation.lock().await;
+        let preferences = self
+            .preference_request(Preference::RefreshMinutes(minutes))
+            .await?;
+        self.publish_preferences(&emitter, preferences).await
+    }
+
+    /// Chooses whether the client lays out as many card columns as the window fits.
+    async fn set_columns_auto(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        enabled: bool,
+    ) -> fdo::Result<()> {
+        let _guard = self.preference_mutation.lock().await;
+        let preferences = self
+            .preference_request(Preference::ColumnsAuto(enabled))
+            .await?;
+        self.publish_preferences(&emitter, preferences).await
+    }
+
+    /// Sets the most card columns a window lays out while Auto is off.
+    async fn set_max_columns(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        columns: u32,
+    ) -> fdo::Result<()> {
+        if !Preferences::valid_max_columns(columns) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "max columns must be at least 1, not {columns}"
+            )));
+        }
+        let _guard = self.preference_mutation.lock().await;
+        let preferences = self
+            .preference_request(Preference::MaxColumns(columns))
+            .await?;
+        self.publish_preferences(&emitter, preferences).await
+    }
+
+    /// Points every outbound request and every child process at a proxy, or at none.
+    ///
+    /// Takes all three values together because they are one setting: applying a mode
+    /// before its host, or a host before its port, would put a proxy that cannot be
+    /// reached in front of every provider between the two calls.
+    async fn set_proxy(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        mode: &str,
+        host: &str,
+        port: u16,
+    ) -> fdo::Result<()> {
+        if !Preferences::valid_proxy_mode(mode) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "unknown proxy mode {mode:?}"
+            )));
+        }
+        let _guard = self.preference_mutation.lock().await;
+        let preferences = self
+            .preference_request(Preference::Proxy {
+                mode: mode.into(),
+                host: host.into(),
+                port,
+            })
+            .await?;
+        self.publish_preferences(&emitter, preferences).await
+    }
+
+    /// Deletes every historical reading and refreshes the published storage facts.
+    async fn clear_history(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<()> {
+        self.config_request(|reply| Command::ClearHistory { reply })
+            .await?;
+        self.announce_data(&emitter).await?;
+        Ok(())
+    }
+
+    /// Puts the configured providers in the order a client's user arranged them in.
+    ///
+    /// The order is the `providers` array in `config.toml` — the same array that says which
+    /// accounts exist, because it is already ordered and `AddProvider` already appends to
+    /// it. A second array beside it would only raise the question of what the position of a
+    /// provider named in one and not the other is.
+    ///
+    /// The list must name every configured provider exactly once. A client whose idea of
+    /// the set has been overtaken by an add or a remove is told so rather than having the
+    /// daemon guess: it can read `GetStatus` again and it will be sent `OrderChanged`
+    /// whenever anybody else succeeds.
+    ///
+    /// The identity is the provider slug and not the provider/account pair, because that
+    /// is the only identity the settings file has. v1 configures one `default` account per
+    /// provider; multi-account changes the shape of that array, and this call with it.
+    async fn set_order(&self, providers: Vec<String>) -> fdo::Result<()> {
+        let configured: Vec<String> = self
+            .statuses
+            .all()
+            .await
+            .into_iter()
+            .map(|status| status.provider)
+            .collect();
+        let mut wanted = providers.clone();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut held = configured.clone();
+        held.sort_unstable();
+        held.dedup();
+        if wanted.len() != providers.len() || wanted != held {
+            return Err(fdo::Error::InvalidArgs(
+                "the order must name every configured provider exactly once".into(),
+            ));
+        }
+
+        self.config_request(|reply| Command::SetOrder {
+            providers: providers.clone(),
+            reply,
+        })
+        .await?;
+        tracing::info!(?providers, "card order changed");
+        Ok(())
+    }
+
+    /// Validates a plugin file and reports what it declares, storing nothing.
+    ///
+    /// The import preview. Nothing becomes configurable and nothing is polled, so a file a
+    /// user is only looking at cannot reach the network by being looked at.
+    async fn inspect_plugin(&self, bytes: Vec<u8>) -> fdo::Result<PluginInfo> {
+        self.plugin_request(|reply| Command::InspectPlugin { bytes, reply })
+            .await
+    }
+
+    /// Validates and installs a plugin file, replacing an earlier version of the same id.
+    async fn install_plugin(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        bytes: Vec<u8>,
+    ) -> fdo::Result<PluginInfo> {
+        let (info, change) = self
+            .plugin_request(|reply| Command::InstallPlugin { bytes, reply })
+            .await?;
+        self.apply_plugin_change(&emitter, change).await?;
+        tracing::info!(plugin = %info.id, version = %info.plugin_version, "plugin installed");
+        Ok(info)
+    }
+
+    /// Removes an installed definition. Refused while any account still uses it.
+    async fn remove_plugin(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        provider: &str,
+    ) -> fdo::Result<()> {
+        let change = self
+            .plugin_request(|reply| Command::RemovePlugin {
+                provider: provider.to_owned(),
+                reply,
+            })
+            .await?;
+        self.apply_plugin_change(&emitter, change).await?;
+        tracing::info!(plugin = provider, "plugin removed");
+        Ok(())
+    }
+
+    /// Sets one plugin account's complete metrics URL, and whether plain http is accepted
+    /// for it.
+    ///
+    /// Per account and never shared: two accounts of one plugin are two endpoints, because
+    /// they are two keys, and one URL for both would send the wrong key to a host.
+    async fn set_plugin_endpoint(
+        &self,
+        provider: &str,
+        account: &str,
+        endpoint: &str,
+        allow_insecure_http: bool,
+    ) -> fdo::Result<()> {
+        let mutation = self.mutation(provider, account).await;
+        let _guard = mutation.lock().await;
+        if !self
+            .configured
+            .read()
+            .await
+            .contains(&key(provider, account))
+        {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "no account {account} is configured for {provider}"
+            )));
+        }
+        self.config_request(|reply| Command::SetPluginEndpoint {
+            provider: provider.to_owned(),
+            account: account.to_owned(),
+            endpoint: endpoint.to_owned(),
+            allow_insecure_http,
+            reply,
+        })
+        .await
+        .map_err(invalid_plugin_argument)?;
+        tracing::info!(provider, account, "plugin endpoint set");
+        Ok(())
+    }
+
+    /// Runs a plugin's parser against a local response fixture: the authoring loop, with no
+    /// key read and no request made.
+    async fn render_plugin(&self, bytes: Vec<u8>, response: Vec<u8>) -> fdo::Result<Presentation> {
+        self.plugin_request(|reply| Command::RenderPlugin {
+            bytes,
+            response,
+            reply,
+        })
+        .await
+    }
+
+    /// The daemon's version, so a client can tell what it is talking to.
+    #[zbus(property(emits_changed_signal = "false"))]
+    async fn version(&self) -> String {
+        env!("CARGO_PKG_VERSION").to_owned()
+    }
+
+    /// One account's status changed: it was polled, it failed, or it is waiting for
+    /// something. Carries the same shape as `GetStatus`, so a client has one parser.
+    #[zbus(signal)]
+    pub async fn provider_changed(
+        emitter: &SignalEmitter<'_>,
+        status: ProviderStatus,
+    ) -> zbus::Result<()>;
+
+    /// One configured account was removed after its owned credentials were deleted.
+    #[zbus(signal)]
+    pub async fn provider_removed(
+        emitter: &SignalEmitter<'_>,
+        provider: &str,
+        account: &str,
+    ) -> zbus::Result<()>;
+
+    /// The configured providers are now in this order.
+    ///
+    /// Its own signal rather than a burst of `ProviderChanged`, because a status has no
+    /// position in it: a client holding cards needs the sequence, not the readings again.
+    /// `GetStatus` answers in the same order from the moment this is emitted.
+    #[zbus(signal)]
+    pub async fn order_changed(
+        emitter: &SignalEmitter<'_>,
+        providers: Vec<String>,
+    ) -> zbus::Result<()>;
+
+    /// Application preferences changed.
+    #[zbus(signal)]
+    pub async fn preferences_changed(
+        emitter: &SignalEmitter<'_>,
+        preferences: Preferences,
+    ) -> zbus::Result<()>;
+
+    /// Paths or storage facts changed.
+    #[zbus(signal)]
+    pub async fn data_changed(emitter: &SignalEmitter<'_>, data: DataInfo) -> zbus::Result<()>;
+
+    /// Availability of a newer published release changed; empty means there is none.
+    #[zbus(signal)]
+    pub async fn update_changed(emitter: &SignalEmitter<'_>, version: &str) -> zbus::Result<()>;
+
+    /// The installed plugin definitions changed: one was imported, replaced or removed.
+    ///
+    /// Carries the whole list rather than the one that changed, because a client renders
+    /// them as a set and a delta it had to reassemble would be one more thing to get wrong.
+    #[zbus(signal)]
+    pub async fn plugins_changed(
+        emitter: &SignalEmitter<'_>,
+        plugins: Vec<PluginInfo>,
+    ) -> zbus::Result<()>;
+
+    /// Another client asks the visible one to come forward. A second UI instance on a
+    /// platform without session-bus uniqueness calls `RequestActivate` and exits;
+    /// this is how the running window hears about it.
+    #[zbus(signal)]
+    pub async fn activate_requested(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+}
+
+fn file_size(path: impl AsRef<std::path::Path>) -> u64 {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+/// A plugin failure as a D-Bus error.
+///
+/// `InvalidArgs` rather than `Failed`: the message already names the one stage that refused
+/// the file — schema, SVG, Lua compile, limit or semantic output — and a client shows it
+/// beside the file the user chose.
+fn invalid_plugin_argument(error: fdo::Error) -> fdo::Error {
+    match error {
+        fdo::Error::Failed(message) => fdo::Error::InvalidArgs(message),
+        other => other,
+    }
+}
+
+/// The pair an in-progress login is filed under.
+fn key(provider: &str, account: &str) -> AccountKey {
+    (provider.to_owned(), account.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use highwater_types::{
+        AccountId, AuthCandidate, AuthSelection, ProviderDefinition, ProviderId, ids,
+    };
+
+    fn status(provider: &str) -> ProviderStatus {
+        ProviderStatus::pending(&ProviderId::new(provider), &AccountId::default())
+    }
+
+    /// A keyring that remembers what it was told, so the credential calls can be checked
+    /// without a Secret Service and without a bus.
+    #[derive(Debug, Default)]
+    struct FakeSecrets(std::sync::Mutex<HashMap<(String, String, String), String>>);
+
+    #[derive(Debug, Default)]
+    struct FakeStartup {
+        attempts: std::sync::Mutex<Vec<String>>,
+        fail_next: std::sync::Mutex<bool>,
+    }
+
+    impl FakeStartup {
+        fn failing_once() -> Self {
+            Self {
+                attempts: std::sync::Mutex::new(Vec::new()),
+                fail_next: std::sync::Mutex::new(true),
+            }
+        }
+
+        fn attempts(&self) -> Vec<String> {
+            self.attempts
+                .lock()
+                .expect("no test panics holding this")
+                .clone()
+        }
+    }
+
+    impl Startup for FakeStartup {
+        fn set_startup_mode(&self, mode: &str) -> Result<(), String> {
+            self.attempts
+                .lock()
+                .expect("no test panics holding this")
+                .push(mode.to_owned());
+            let mut fail_next = self.fail_next.lock().expect("no test panics holding this");
+            if std::mem::take(&mut *fail_next) {
+                Err("simulated startup integration failure".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl FakeSecrets {
+        fn held(&self) -> Vec<(String, String, String, String)> {
+            let map = self.0.lock().expect("no test panics holding this");
+            let mut entries: Vec<_> = map
+                .iter()
+                .map(|((kind, provider, account), secret)| {
+                    (
+                        kind.clone(),
+                        provider.clone(),
+                        account.clone(),
+                        secret.clone(),
+                    )
+                })
+                .collect();
+            entries.sort();
+            entries
+        }
+    }
+
+    fn slot(kind: Kind, provider: &ProviderId, account: &AccountId) -> (String, String, String) {
+        let kind = match kind {
+            Kind::Key => "key",
+            Kind::Token => "token",
+            Kind::Session => "session",
+        };
+        (
+            kind.to_owned(),
+            provider.as_str().to_owned(),
+            account.as_str().to_owned(),
+        )
+    }
+
+    impl Secrets for FakeSecrets {
+        fn get<'a>(
+            &'a self,
+            kind: Kind,
+            provider: &'a ProviderId,
+            account: &'a AccountId,
+        ) -> highwater_core::providers::BoxFuture<'a, Result<Option<Credential>, SecretError>>
+        {
+            let held = self
+                .0
+                .lock()
+                .expect("no test panics holding this")
+                .get(&slot(kind, provider, account))
+                .cloned()
+                .map(Credential::new);
+            Box::pin(async move { Ok(held) })
+        }
+
+        fn set<'a>(
+            &'a self,
+            kind: Kind,
+            provider: &'a ProviderId,
+            account: &'a AccountId,
+            secret: &'a Credential,
+        ) -> highwater_core::providers::BoxFuture<'a, Result<(), SecretError>> {
+            self.0
+                .lock()
+                .expect("no test panics holding this")
+                .insert(slot(kind, provider, account), secret.expose().to_owned());
+            Box::pin(async { Ok(()) })
+        }
+
+        fn compare_and_set<'a>(
+            &'a self,
+            kind: Kind,
+            provider: &'a ProviderId,
+            account: &'a AccountId,
+            expected: &'a Credential,
+            replacement: &'a Credential,
+        ) -> highwater_core::providers::BoxFuture<'a, Result<bool, SecretError>> {
+            let mut held = self.0.lock().expect("no test panics holding this");
+            let slot = slot(kind, provider, account);
+            let matches = held.get(&slot).map(String::as_str) == Some(expected.expose());
+            if matches {
+                held.insert(slot, replacement.expose().to_owned());
+            }
+            Box::pin(async move { Ok(matches) })
+        }
+
+        fn delete<'a>(
+            &'a self,
+            kind: Kind,
+            provider: &'a ProviderId,
+            account: &'a AccountId,
+        ) -> highwater_core::providers::BoxFuture<'a, Result<(), SecretError>> {
+            self.0
+                .lock()
+                .expect("no test panics holding this")
+                .remove(&slot(kind, provider, account));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[test]
+    fn the_interface_name_is_the_one_clients_are_told_about() {
+        // The attribute above needs a literal; this is what stops the two drifting apart.
+        assert_eq!(
+            "io.github.kakadon000.Highwater.Daemon1",
+            ids::DAEMON_INTERFACE
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_keeps_its_place_when_it_is_updated() {
+        let published = Published::default();
+        published.upsert(status("zai")).await;
+        published.upsert(status("kimi")).await;
+
+        let mut updated = status("zai");
+        updated.captured_at = Some(1_785_700_000);
+        published.upsert(updated).await;
+
+        let all = published.all().await;
+        assert_eq!(all.len(), 2, "an update replaces rather than appends");
+        assert_eq!(all[0].provider, "zai", "and does not reorder the grid");
+        assert_eq!(all[0].captured_at, Some(1_785_700_000));
+    }
+
+    #[tokio::test]
+    async fn update_publication_changes_only_when_the_version_changes() {
+        let update = PublishedUpdate::default();
+        assert_eq!(update.get().await, "");
+        update.set_enabled(true).await;
+        assert_eq!(
+            update
+                .publish(Some(Release::new("0.2.0", "the notes")))
+                .await,
+            Some("0.2.0".into())
+        );
+        assert_eq!(
+            update
+                .publish(Some(Release::new("0.2.0", "the notes")))
+                .await,
+            None
+        );
+        assert_eq!(update.get().await, "0.2.0");
+        assert_eq!(update.notes().await, "the notes");
+
+        // The author edited the release body: clients already showing 0.2.0 are not told
+        // again, and the next one to read the notes gets the corrected text.
+        assert_eq!(
+            update
+                .publish(Some(Release::new("0.2.0", "the fixed notes")))
+                .await,
+            None
+        );
+        assert_eq!(update.notes().await, "the fixed notes");
+
+        assert_eq!(update.publish(None).await, Some(String::new()));
+        assert_eq!(update.get().await, "");
+        assert_eq!(update.notes().await, "");
+    }
+
+    #[tokio::test]
+    async fn a_disabled_release_check_drops_results_and_forgets_the_release() {
+        let update = PublishedUpdate::default();
+        update.set_enabled(true).await;
+        assert_eq!(
+            update
+                .publish(Some(Release::new("0.2.0", "the notes")))
+                .await,
+            Some("0.2.0".into())
+        );
+
+        // Disabling both latches the flag and forgets the release in one write...
+        assert!(update.set_enabled(false).await);
+        assert_eq!(update.get().await, "");
+        assert_eq!(update.notes().await, "");
+        // ...and a result that was already in flight lands nowhere.
+        assert_eq!(update.publish(Some(Release::new("0.3.0", ""))).await, None);
+        assert_eq!(update.get().await, "");
+
+        // Re-enabling starts from nothing until a check succeeds again.
+        assert!(!update.set_enabled(true).await);
+        assert_eq!(update.get().await, "");
+    }
+
+    #[tokio::test]
+    async fn removing_a_published_account_does_not_reorder_the_rest() {
+        let published = Published::default();
+        published.upsert(status("zai")).await;
+        published.upsert(status("kimi")).await;
+
+        assert!(published.remove("zai", "default").await.is_some());
+        assert_eq!(published.all().await[0].provider, "kimi");
+    }
+
+    #[tokio::test]
+    async fn a_reorder_moves_the_published_accounts_into_that_sequence() {
+        let published = Published::default();
+        published.upsert(status("zai")).await;
+        published.upsert(status("kimi")).await;
+        published.upsert(status("claude")).await;
+        published
+            .reorder(&[
+                ("claude".into(), "default".into()),
+                ("zai".into(), "default".into()),
+                ("kimi".into(), "default".into()),
+            ])
+            .await;
+
+        let providers: Vec<String> = published
+            .all()
+            .await
+            .into_iter()
+            .map(|status| status.provider)
+            .collect();
+        assert_eq!(providers, ["claude", "zai", "kimi"]);
+    }
+
+    #[tokio::test]
+    async fn the_published_order_follows_account_order_after_reordering() {
+        let published = Published::default();
+        let default = status("zai");
+        let mut work = status("zai");
+        work.account = "work".into();
+        published.upsert(default.clone()).await;
+        published.upsert(work.clone()).await;
+        published.upsert(status("kimi")).await;
+
+        published
+            .reorder(&[
+                ("zai".into(), "work".into()),
+                ("zai".into(), "default".into()),
+                ("kimi".into(), "default".into()),
+            ])
+            .await;
+
+        let accounts: Vec<(String, String)> = published
+            .all()
+            .await
+            .into_iter()
+            .map(|status| (status.provider, status.account))
+            .collect();
+        assert_eq!(
+            accounts,
+            [
+                ("zai".into(), "work".into()),
+                ("zai".into(), "default".into()),
+                ("kimi".into(), "default".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reorder_leaves_an_account_it_does_not_name_at_the_end() {
+        let published = Published::default();
+        published.upsert(status("zai")).await;
+        published.upsert(status("kimi")).await;
+        published.upsert(status("claude")).await;
+        published
+            .reorder(&[("claude".into(), "default".into())])
+            .await;
+
+        let providers: Vec<String> = published
+            .all()
+            .await
+            .into_iter()
+            .map(|status| status.provider)
+            .collect();
+        assert_eq!(
+            providers,
+            ["claude", "zai", "kimi"],
+            "the unnamed survivors keep the order they were in"
+        );
+    }
+
+    fn key_account(provider: &str) -> ProviderStatus {
+        let mut status = status(provider);
+        status.credential = Some(CredentialKind::Key.as_wire().to_owned());
+        status
+    }
+
+    fn oauth_account(provider: &str) -> ProviderStatus {
+        let mut status = status(provider);
+        status.credential = Some(CredentialKind::OAuth.as_wire().to_owned());
+        status
+    }
+
+    /// One non-default account of a provider, the shape a second card carries.
+    fn account_of(provider: &str, account: &str) -> ProviderStatus {
+        let mut status = key_account(provider);
+        status.account = account.to_owned();
+        status
+    }
+
+    fn catalog() -> Vec<ProviderDefinition> {
+        vec![ProviderDefinition {
+            provider: "zai".into(),
+            title: "Z.ai".into(),
+            credential: "key".into(),
+            credential_hint: "Z.ai dashboard → API keys.".into(),
+            external: None,
+            browser_auth: None,
+            options: Vec::new(),
+            plugin: None,
+        }]
+    }
+
+    /// A catalog of keyed providers, for tests that need more than one provider.
+    fn catalog_with(providers: &[&str]) -> Vec<ProviderDefinition> {
+        providers
+            .iter()
+            .map(|provider| ProviderDefinition {
+                provider: (*provider).into(),
+                title: (*provider).into(),
+                credential: "key".into(),
+                credential_hint: format!("{provider} dashboard → API keys."),
+                external: None,
+                browser_auth: None,
+                options: Vec::new(),
+                plugin: None,
+            })
+            .collect()
+    }
+
+    /// A daemon over a fixed set of accounts, with the channel its commands land on.
+    async fn daemon_over(
+        accounts: Vec<ProviderStatus>,
+    ) -> (Daemon, Arc<FakeSecrets>, mpsc::Receiver<Command>) {
+        daemon_over_catalog(accounts, Vec::new()).await
+    }
+
+    async fn daemon_over_catalog(
+        accounts: Vec<ProviderStatus>,
+        catalog: Vec<ProviderDefinition>,
+    ) -> (Daemon, Arc<FakeSecrets>, mpsc::Receiver<Command>) {
+        let configured = accounts
+            .iter()
+            .map(|account| (account.provider.clone(), account.account.clone()))
+            .collect();
+        let published = Published::default();
+        for account in accounts {
+            published.upsert(account).await;
+        }
+        let secrets = Arc::new(FakeSecrets::default());
+        let (tx, rx) = mpsc::channel(8);
+        (
+            Daemon::new(
+                published,
+                PublishedUpdate::default(),
+                catalog,
+                configured,
+                tx,
+                Arc::clone(&secrets) as Arc<dyn Secrets>,
+            ),
+            secrets,
+            rx,
+        )
+    }
+
+    struct StaleRefresh {
+        loaded: oneshot::Receiver<()>,
+        release: oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<bool>,
+    }
+
+    fn stale_refresh_barrier(secrets: Arc<FakeSecrets>, provider: &'static str) -> StaleRefresh {
+        let (loaded_tx, loaded) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let provider = ProviderId::new(provider);
+            let account = AccountId::default();
+            let expected = secrets
+                .get(Kind::Token, &provider, &account)
+                .await
+                .expect("refresh reads the keyring")
+                .expect("expired token seeded");
+            loaded_tx.send(()).expect("test waits at refresh barrier");
+            release_rx.await.expect("refresh released");
+            secrets
+                .compare_and_set(
+                    Kind::Token,
+                    &provider,
+                    &account,
+                    &expected,
+                    &Credential::new("stale-refresh"),
+                )
+                .await
+                .expect("refresh persistence reaches keyring")
+        });
+        StaleRefresh {
+            loaded,
+            release,
+            task,
+        }
+    }
+
+    async fn seed_token(secrets: &FakeSecrets, provider: &str, document: &str) {
+        secrets
+            .set(
+                Kind::Token,
+                &ProviderId::new(provider),
+                &AccountId::default(),
+                &Credential::new(document),
+            )
+            .await
+            .expect("token seeded");
+    }
+
+    #[tokio::test]
+    async fn the_daemon_lists_the_catalog_even_with_no_statuses() {
+        let definition = ProviderDefinition {
+            provider: "zai".into(),
+            title: "Z.ai".into(),
+            credential: "key".into(),
+            credential_hint: "Z.ai dashboard → API keys.".into(),
+            external: None,
+            browser_auth: None,
+            options: Vec::new(),
+            plugin: None,
+        };
+        let (daemon, _secrets, _commands) =
+            daemon_over_catalog(Vec::new(), vec![definition.clone()]).await;
+
+        assert_eq!(daemon.list_providers().await, vec![definition]);
+    }
+
+    #[tokio::test]
+    async fn a_configured_account_validates_before_first_status_publication() {
+        let published = Published::default();
+        let secrets = Arc::new(FakeSecrets::default());
+        let (commands, mut command_queue) = mpsc::channel(4);
+        let daemon = Daemon::new(
+            published,
+            PublishedUpdate::default(),
+            catalog(),
+            vec![("zai".into(), "default".into())],
+            commands,
+            Arc::clone(&secrets) as Arc<dyn Secrets>,
+        );
+
+        daemon
+            .refresh("zai")
+            .await
+            .expect("loaded identity refreshes before publication");
+        assert!(matches!(
+            command_queue.try_recv().expect("the loop was told"),
+            Command::Refresh(Some(provider)) if provider == "zai"
+        ));
+
+        daemon
+            .set_key("zai", "default", "startup-key")
+            .await
+            .expect("loaded configuration is authoritative before publication");
+
+        assert_eq!(
+            secrets.held(),
+            vec![(
+                "key".into(),
+                "zai".into(),
+                "default".into(),
+                "startup-key".into()
+            )]
+        );
+        assert!(matches!(
+            command_queue.try_recv().expect("the loop was told"),
+            Command::Reload { provider: Some(provider) } if provider == "zai"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_configured_account_without_a_status_publishes_its_slug_as_the_label() {
+        let (commands, _queue) = mpsc::channel(4);
+        let daemon = Daemon::new(
+            Published::default(),
+            PublishedUpdate::default(),
+            catalog(),
+            vec![
+                ("zai".into(), "default".into()),
+                ("zai".into(), "work".into()),
+            ],
+            commands,
+            Arc::new(FakeSecrets::default()),
+        );
+
+        let labelled = daemon
+            .account("zai", "work")
+            .await
+            .expect("configured before publication");
+        assert_eq!(labelled.account_label.as_deref(), Some("work"));
+        let plain = daemon
+            .account("zai", "default")
+            .await
+            .expect("configured before publication");
+        assert_eq!(
+            plain.account_label, None,
+            "the default account is the provider itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_segment_is_serialized_through_the_engine() {
+        let (daemon, _secrets, mut commands) = daemon_over(vec![key_account("zai")]).await;
+        let responder = tokio::spawn(async move {
+            let Command::CurrentSegment {
+                provider,
+                account,
+                window,
+                reply,
+            } = commands.recv().await.expect("command")
+            else {
+                panic!("unexpected command");
+            };
+            assert_eq!(
+                (provider.as_str(), account.as_str(), window.as_str()),
+                ("zai", "default", "w18000")
+            );
+            reply
+                .send(Ok(vec![highwater_types::HistoryPoint {
+                    captured_at: 1_785_700_000,
+                    used_percent: 42.0,
+                }]))
+                .expect("caller waits");
+        });
+
+        let points = daemon
+            .current_segment("zai", "default", "w18000")
+            .await
+            .expect("configured account reads history");
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].used_percent, 42.0);
+        responder.await.expect("responder finishes");
+    }
+
+    #[tokio::test]
+    async fn current_segment_for_an_unconfigured_account_does_not_reach_the_engine() {
+        let (daemon, _secrets, mut commands) = daemon_over(Vec::new()).await;
+        let error = daemon
+            .current_segment("zai", "default", "w18000")
+            .await
+            .expect_err("unknown account is rejected");
+        assert!(matches!(error, fdo::Error::InvalidArgs(_)));
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn adding_waits_for_the_engine_result() {
+        let (daemon, _secrets, mut commands) = daemon_over_catalog(Vec::new(), catalog()).await;
+        let responder = tokio::spawn(async move {
+            match commands.recv().await.expect("command") {
+                Command::AddProvider { provider, reply } => {
+                    assert_eq!(provider, "zai");
+                    reply.send(Ok(())).expect("caller waits");
+                }
+                command => panic!("unexpected command: {command:?}"),
+            }
+        });
+
+        daemon.add_provider("zai").await.expect("added");
+        responder.await.expect("responder finished");
+    }
+
+    #[tokio::test]
+    async fn adding_an_unknown_provider_is_an_invalid_argument() {
+        let (daemon, _secrets, mut commands) = daemon_over_catalog(Vec::new(), catalog()).await;
+
+        let error = daemon
+            .add_provider("not-a-provider")
+            .await
+            .expect_err("unknown providers are rejected before the engine");
+
+        assert!(matches!(error, fdo::Error::InvalidArgs(_)));
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_engine_add_failure_is_returned_to_the_caller() {
+        let (daemon, _secrets, mut commands) = daemon_over_catalog(Vec::new(), catalog()).await;
+        let responder = tokio::spawn(async move {
+            let Command::AddProvider { reply, .. } = commands.recv().await.expect("command") else {
+                panic!("unexpected command");
+            };
+            reply
+                .send(Err("config is read-only".into()))
+                .expect("caller waits");
+        });
+
+        let error = daemon
+            .add_provider("zai")
+            .await
+            .expect_err("engine failure crosses D-Bus boundary");
+
+        assert!(matches!(error, fdo::Error::Failed(reason) if reason == "config is read-only"));
+        responder.await.expect("responder finished");
+    }
+
+    #[tokio::test]
+    async fn adding_an_account_waits_for_the_engine_result() {
+        let (daemon, _secrets, mut commands) =
+            daemon_over_catalog(vec![key_account("zai")], catalog()).await;
+        let responder = tokio::spawn(async move {
+            match commands.recv().await.expect("command") {
+                Command::AddAccount {
+                    provider,
+                    account,
+                    reply,
+                } => {
+                    assert_eq!((provider.as_str(), account.as_str()), ("zai", "work"));
+                    reply.send(Ok(())).expect("caller waits");
+                }
+                command => panic!("unexpected command: {command:?}"),
+            }
+        });
+
+        daemon.add_account("zai", "work").await.expect("added");
+        responder.await.expect("responder finished");
+
+        daemon
+            .account("zai", "work")
+            .await
+            .expect("the configured set knows the new account straight away");
+    }
+
+    #[tokio::test]
+    async fn adding_an_account_for_an_unknown_provider_is_an_invalid_argument() {
+        let (daemon, _secrets, mut commands) = daemon_over_catalog(Vec::new(), catalog()).await;
+
+        let error = daemon
+            .add_account("not-a-provider", "work")
+            .await
+            .expect_err("unknown providers are rejected before the engine");
+
+        assert!(matches!(error, fdo::Error::InvalidArgs(_)));
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_account_id_is_an_invalid_argument() {
+        let (daemon, _secrets, mut commands) = daemon_over_catalog(Vec::new(), catalog()).await;
+
+        for id in [
+            "", " ", "work-", "-work", "work ", "work/2", "work.2", "work\n",
+        ] {
+            let error = daemon.add_account("zai", id).await.unwrap_err();
+            assert!(
+                matches!(error, fdo::Error::InvalidArgs(_)),
+                "{id:?} is not an id the config can hold"
+            );
+        }
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn adding_an_already_configured_account_id_is_an_invalid_argument() {
+        let (daemon, _secrets, mut commands) =
+            daemon_over_catalog(vec![key_account("zai")], catalog()).await;
+
+        let error = daemon
+            .add_account("zai", "default")
+            .await
+            .expect_err("a configured id cannot be added twice");
+        assert!(matches!(error, fdo::Error::InvalidArgs(_)));
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        // And one added in this session, not only one loaded from config.
+        let responder = tokio::spawn(async move {
+            let Command::AddAccount { reply, .. } = commands.recv().await.expect("command") else {
+                panic!("unexpected command");
+            };
+            reply.send(Ok(())).expect("caller waits");
+            commands
+        });
+        daemon.add_account("zai", "work").await.expect("added");
+        let mut commands = responder.await.expect("responder finished");
+
+        let error = daemon
+            .add_account("zai", "work")
+            .await
+            .expect_err("the session's own add is in the configured set too");
+        assert!(matches!(error, fdo::Error::InvalidArgs(_)));
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_removal_deletes_its_credentials_only_after_the_engine_persisted_it() {
+        let (daemon, secrets, mut commands) =
+            daemon_over_catalog(vec![key_account("zai")], catalog()).await;
+        for kind in Kind::ALL {
+            secrets
+                .set(
+                    kind,
+                    &ProviderId::new("zai"),
+                    &AccountId::default(),
+                    &Credential::new("owned"),
+                )
+                .await
+                .expect("seeded");
+        }
+        let seeded = secrets.held();
+        assert_eq!(seeded.len(), Kind::ALL.len(), "every owned kind is seeded");
+        let observed = Arc::clone(&secrets);
+        let responder = tokio::spawn(async move {
+            match commands.recv().await.expect("command") {
+                Command::RemoveProvider {
+                    provider,
+                    account,
+                    reply,
+                } => {
+                    assert_eq!((provider.as_str(), account.as_str()), ("zai", "default"));
+                    assert_eq!(
+                        observed.held(),
+                        seeded,
+                        "nothing is deleted before the removal is durable: a promotion that \
+                         fails inside the engine would strand the topology without its \
+                         credentials"
+                    );
+                    reply.send(Ok(Vec::new())).expect("caller waits");
+                }
+                command => panic!("unexpected command: {command:?}"),
+            }
+        });
+
+        daemon
+            .remove_provider("zai", "default")
+            .await
+            .expect("removed");
+
+        assert!(
+            secrets.held().is_empty(),
+            "after a durable removal the keyring holds nothing for the account"
+        );
+        responder.await.expect("responder finished");
+    }
+
+    #[tokio::test]
+    async fn a_credential_mutation_cannot_overlap_successful_removal() {
+        let (daemon, secrets, mut commands) =
+            daemon_over_catalog(vec![key_account("zai")], catalog()).await;
+        let daemon = Arc::new(daemon);
+        let (remove_seen, removal_reached_engine) = tokio::sync::oneshot::channel();
+        let (finish_removal, release_engine_reply) = tokio::sync::oneshot::channel();
+        let responder = tokio::spawn(async move {
+            let Command::RemoveProvider { reply, .. } = commands.recv().await.expect("command")
+            else {
+                panic!("unexpected command");
+            };
+            remove_seen.send(()).expect("test is waiting");
+            let _ = release_engine_reply.await;
+            reply.send(Ok(Vec::new())).expect("caller waits");
+            commands
+        });
+        let removing = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move { daemon.remove_provider("zai", "default").await }
+        });
+        removal_reached_engine
+            .await
+            .expect("removal reached the engine holding the account's lock");
+
+        let setting = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move { daemon.set_key("zai", "default", "too-late").await }
+        });
+        for _ in 0..10 {
+            if setting.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !setting.is_finished(),
+            "credential mutation must wait for removal to finish"
+        );
+
+        finish_removal.send(()).expect("responder waits");
+        removing
+            .await
+            .expect("removal task did not panic")
+            .expect("engine accepted removal");
+        let error = setting
+            .await
+            .expect("credential task did not panic")
+            .expect_err("the account is no longer configured");
+        assert!(matches!(error, fdo::Error::InvalidArgs(_)));
+        assert!(secrets.held().is_empty());
+        let mut commands = responder.await.expect("responder finished");
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_promoting_removal_leaves_the_survivors_credential_to_the_engine() {
+        let (daemon, secrets, mut commands) = daemon_over_catalog(
+            vec![key_account("zai"), account_of("zai", "work")],
+            catalog(),
+        )
+        .await;
+        for account in ["default", "work"] {
+            secrets
+                .set(
+                    Kind::Key,
+                    &ProviderId::new("zai"),
+                    &AccountId::new(account),
+                    &Credential::new(format!("{account}-key")),
+                )
+                .await
+                .expect("seeded");
+        }
+        let held = secrets.held();
+        let responder = tokio::spawn(async move {
+            let Command::RemoveProvider {
+                provider,
+                account,
+                reply,
+            } = commands.recv().await.expect("command")
+            else {
+                panic!("unexpected command");
+            };
+            assert_eq!((provider.as_str(), account.as_str()), ("zai", "default"));
+            // The engine promotes `work` into the `default` slot and moves that
+            // credential itself; deleting under `default` here would take the survivor's
+            // key with it.
+            reply
+                .send(Ok(vec![("zai".into(), "default".into())]))
+                .expect("caller waits");
+        });
+
+        daemon
+            .remove_provider("zai", "default")
+            .await
+            .expect("removed");
+
+        assert_eq!(
+            secrets.held(),
+            held,
+            "promotion cleanup belongs to the engine, which knows the survivor's kind"
+        );
+        responder.await.expect("responder finished");
+    }
+
+    #[tokio::test]
+    async fn a_promoting_removal_reconciles_the_configured_set_to_the_new_identity() {
+        let (daemon, _secrets, mut commands) = daemon_over_catalog(
+            vec![key_account("zai"), account_of("zai", "work")],
+            catalog(),
+        )
+        .await;
+        let responder = tokio::spawn(async move {
+            let Command::RemoveProvider { reply, .. } = commands.recv().await.expect("command")
+            else {
+                panic!("unexpected command");
+            };
+            // The engine renamed `work` into `default`; the reply carries the survivors.
+            reply
+                .send(Ok(vec![("zai".into(), "default".into())]))
+                .expect("caller waits");
+        });
+
+        daemon
+            .remove_provider("zai", "default")
+            .await
+            .expect("removed");
+
+        daemon
+            .account("zai", "default")
+            .await
+            .expect("the promoted identity is configured under its new id");
+        assert!(
+            matches!(
+                daemon.account("zai", "work").await,
+                Err(fdo::Error::InvalidArgs(_))
+            ),
+            "the id the survivor no longer uses must stop validating"
+        );
+        responder.await.expect("responder finished");
+    }
+
+    #[tokio::test]
+    async fn a_credential_mutation_cannot_overlap_a_promoting_removal() {
+        let (daemon, _secrets, mut commands) = daemon_over_catalog(
+            vec![key_account("zai"), account_of("zai", "work")],
+            catalog(),
+        )
+        .await;
+        let daemon = Arc::new(daemon);
+        let (remove_seen, removal_reached_engine) = tokio::sync::oneshot::channel();
+        let (finish_removal, release_engine_reply) = tokio::sync::oneshot::channel();
+        let responder = tokio::spawn(async move {
+            let Command::RemoveProvider {
+                provider,
+                account,
+                reply,
+            } = commands.recv().await.expect("command")
+            else {
+                panic!("unexpected command");
+            };
+            assert_eq!((provider.as_str(), account.as_str()), ("zai", "default"));
+            remove_seen.send(()).expect("test is waiting");
+            let _ = release_engine_reply.await;
+            reply
+                .send(Ok(vec![("zai".into(), "default".into())]))
+                .expect("caller waits");
+            commands
+        });
+        let removing = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move { daemon.remove_provider("zai", "default").await }
+        });
+        removal_reached_engine
+            .await
+            .expect("removal reached the engine holding every account's lock");
+
+        // The survivor is still called `work` until the engine renames it; a credential
+        // stored under that id while the secret rekey is in flight is the write a
+        // promotion would lose.
+        let setting = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move { daemon.set_key("zai", "work", "too-late").await }
+        });
+        for _ in 0..10 {
+            if setting.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !setting.is_finished(),
+            "a credential mutation for any of the provider's accounts serializes against \
+             the removal"
+        );
+
+        finish_removal.send(()).expect("responder waits");
+        removing
+            .await
+            .expect("removal task did not panic")
+            .expect("engine accepted removal");
+        let error = setting
+            .await
+            .expect("credential task did not panic")
+            .expect_err("the id the survivor no longer uses is gone");
+        assert!(matches!(error, fdo::Error::InvalidArgs(_)));
+        let mut commands = responder.await.expect("responder finished");
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_removal_locks_an_account_added_while_it_was_locking() {
+        let (daemon, secrets, mut commands) = daemon_over_catalog(
+            vec![key_account("zai"), account_of("zai", "work")],
+            catalog(),
+        )
+        .await;
+        let daemon = Arc::new(daemon);
+        let secrets = Arc::clone(&secrets);
+
+        // Hold `work`, the last lock in sorted order, so the removal is parked
+        // mid-acquisition — it already holds `default` — when a concurrent add widens
+        // the provider's id set.
+        let held = daemon.mutation("zai", "work").await;
+        let _held = held.lock().await;
+        let removing = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move { daemon.remove_provider("zai", "default").await }
+        });
+        let mut parked = false;
+        for _ in 0..10_000 {
+            if daemon.mutation("zai", "default").await.try_lock().is_err() {
+                parked = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            parked,
+            "the removal takes the provider's account locks in sorted order"
+        );
+
+        // The concurrent add finished while the removal was locking: `extra` is
+        // configured now, and the removal must not leave it outside its guard.
+        daemon.configured.write().await.insert(key("zai", "extra"));
+        drop(_held);
+
+        let mut locked_extra = false;
+        for _ in 0..10_000 {
+            if daemon.mutation("zai", "extra").await.try_lock().is_err() {
+                locked_extra = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            locked_extra,
+            "a removal re-reads the id set while locking, so an account added beneath it \
+             cannot escape the provider-wide guard"
+        );
+
+        let setting = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move { daemon.set_key("zai", "extra", "sk-late").await }
+        });
+        for _ in 0..10 {
+            if setting.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !setting.is_finished(),
+            "the late account's mutation waits too"
+        );
+
+        let responder = tokio::spawn(async move {
+            let Command::RemoveProvider { reply, .. } = commands.recv().await.expect("command")
+            else {
+                panic!("unexpected command");
+            };
+            reply
+                .send(Ok(vec![
+                    ("zai".into(), "default".into()),
+                    ("zai".into(), "extra".into()),
+                ]))
+                .expect("caller waits");
+            commands
+        });
+        removing
+            .await
+            .expect("removal task did not panic")
+            .expect("engine accepted removal");
+        setting
+            .await
+            .expect("credential task did not panic")
+            .expect("the account the topology kept accepts its key");
+        assert_eq!(
+            secrets.held(),
+            vec![(
+                "key".to_owned(),
+                "zai".to_owned(),
+                "extra".to_owned(),
+                "sk-late".to_owned()
+            )]
+        );
+        let mut commands = responder.await.expect("responder finished");
+        assert!(matches!(
+            commands.recv().await.expect("the stored key wakes the loop"),
+            Command::Reload { provider: Some(provider) } if provider == "zai"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_removal_does_not_wipe_a_concurrent_add_for_another_provider() {
+        let (secrets, mut cleanup_gate) = GatedDeleteSecrets::new();
+        let published = Published::default();
+        published.upsert(key_account("zai")).await;
+        published.upsert(key_account("kimi")).await;
+        let (commands, mut queue) = mpsc::channel(8);
+        let daemon = Arc::new(Daemon::new(
+            published,
+            PublishedUpdate::default(),
+            catalog_with(&["zai", "kimi"]),
+            vec![
+                ("zai".into(), "default".into()),
+                ("kimi".into(), "default".into()),
+            ],
+            commands,
+            secrets,
+        ));
+        let responder = tokio::spawn(async move {
+            // The removal's answer is a snapshot taken before the concurrent add: kimi
+            // still has only its default account in it.
+            let Command::RemoveProvider {
+                provider, reply, ..
+            } = queue.recv().await.expect("removal reaches engine")
+            else {
+                panic!("unexpected command");
+            };
+            assert_eq!(provider, "zai");
+            reply
+                .send(Ok(vec![("kimi".into(), "default".into())]))
+                .expect("caller waits");
+            let Command::AddAccount {
+                provider,
+                account,
+                reply,
+            } = queue.recv().await.expect("add reaches engine")
+            else {
+                panic!("unexpected command");
+            };
+            assert_eq!((provider.as_str(), account.as_str()), ("kimi", "work"));
+            reply.send(Ok(())).expect("caller waits");
+            queue
+        });
+        let removing = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move { daemon.remove_provider("zai", "default").await }
+        });
+
+        // Hold the removal inside its post-success keyring cleanup — two Secret Service
+        // round trips, not a microsecond — while another provider's add completes.
+        let release = cleanup_gate
+            .recv()
+            .await
+            .expect("the removal reached its cleanup window");
+        daemon
+            .add_account("kimi", "work")
+            .await
+            .expect("a different provider's add is not blocked");
+        release.send(()).expect("the removal finishes its cleanup");
+        removing
+            .await
+            .expect("removal task did not panic")
+            .expect("removed");
+        responder.await.expect("responder finished");
+
+        daemon
+            .account("kimi", "work")
+            .await
+            .expect("the concurrent add survives the removal's reconciliation");
+        assert!(matches!(
+            daemon.account("zai", "default").await,
+            Err(fdo::Error::InvalidArgs(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_cannot_undo_the_real_sign_out_mutation() {
+        const PROVIDER: &str = "antigravity";
+        let (daemon, secrets, mut commands) = daemon_over(vec![oauth_account(PROVIDER)]).await;
+        seed_token(&secrets, PROVIDER, "expired-login").await;
+        let StaleRefresh {
+            loaded,
+            release,
+            task,
+        } = stale_refresh_barrier(Arc::clone(&secrets), PROVIDER);
+        loaded.await.expect("refresh loaded the expired login");
+
+        daemon
+            .sign_out(PROVIDER, "default")
+            .await
+            .expect("sign-out completes while refresh is remote");
+        release.send(()).expect("release stale refresh");
+
+        assert!(!task.await.expect("refresh task did not panic"));
+        assert!(secrets.held().is_empty());
+        assert!(matches!(
+            commands.recv().await.expect("sign-out wakes the poll loop"),
+            Command::Reload { provider: Some(provider) } if provider == PROVIDER
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_cannot_restore_a_token_after_real_provider_removal() {
+        const PROVIDER: &str = "antigravity";
+        let (daemon, secrets, mut commands) = daemon_over(vec![oauth_account(PROVIDER)]).await;
+        seed_token(&secrets, PROVIDER, "expired-login").await;
+        let StaleRefresh {
+            loaded,
+            release,
+            task,
+        } = stale_refresh_barrier(Arc::clone(&secrets), PROVIDER);
+        loaded.await.expect("refresh loaded the expired login");
+        let responder = tokio::spawn(async move {
+            let Command::RemoveProvider { reply, .. } =
+                commands.recv().await.expect("removal reaches engine")
+            else {
+                panic!("unexpected command");
+            };
+            reply
+                .send(Ok(Vec::new()))
+                .expect("caller waits for removal");
+        });
+
+        daemon
+            .remove_provider(PROVIDER, "default")
+            .await
+            .expect("provider removed while refresh is remote");
+        assert!(matches!(
+            daemon.account(PROVIDER, "default").await,
+            Err(fdo::Error::InvalidArgs(_))
+        ));
+        release.send(()).expect("release stale refresh");
+
+        assert!(!task.await.expect("refresh task did not panic"));
+        assert!(
+            secrets.held().is_empty(),
+            "unconfigured provider has no token"
+        );
+        responder.await.expect("responder did not panic");
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_cannot_overwrite_the_real_login_commit() {
+        const PROVIDER: &str = "antigravity";
+        let (daemon, secrets, _commands) = daemon_over(vec![oauth_account(PROVIDER)]).await;
+        seed_token(&secrets, PROVIDER, "expired-login").await;
+        let StaleRefresh {
+            loaded,
+            release,
+            task,
+        } = stale_refresh_barrier(Arc::clone(&secrets), PROVIDER);
+        loaded.await.expect("refresh loaded the expired login");
+
+        let mutation = daemon.mutation(PROVIDER, "default").await;
+        commit_login(
+            secrets.as_ref(),
+            &mutation,
+            PROVIDER,
+            "default",
+            &Credential::new("new-login"),
+        )
+        .await
+        .expect("new login committed while refresh is remote");
+        release.send(()).expect("release stale refresh");
+
+        assert!(!task.await.expect("refresh task did not panic"));
+        let stored = secrets
+            .get(
+                Kind::Token,
+                &ProviderId::new(PROVIDER),
+                &AccountId::default(),
+            )
+            .await
+            .expect("keyring read")
+            .expect("new login remains stored");
+        assert_eq!(stored.expose(), "new-login");
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingDeleteSecrets;
+
+    impl Secrets for FailingDeleteSecrets {
+        fn get<'a>(
+            &'a self,
+            _kind: Kind,
+            _provider: &'a ProviderId,
+            _account: &'a AccountId,
+        ) -> highwater_core::providers::BoxFuture<'a, Result<Option<Credential>, SecretError>>
+        {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn set<'a>(
+            &'a self,
+            _kind: Kind,
+            _provider: &'a ProviderId,
+            _account: &'a AccountId,
+            _secret: &'a Credential,
+        ) -> highwater_core::providers::BoxFuture<'a, Result<(), SecretError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn compare_and_set<'a>(
+            &'a self,
+            _kind: Kind,
+            _provider: &'a ProviderId,
+            _account: &'a AccountId,
+            _expected: &'a Credential,
+            _replacement: &'a Credential,
+        ) -> highwater_core::providers::BoxFuture<'a, Result<bool, SecretError>> {
+            Box::pin(async { Ok(false) })
+        }
+
+        fn delete<'a>(
+            &'a self,
+            _kind: Kind,
+            _provider: &'a ProviderId,
+            _account: &'a AccountId,
+        ) -> highwater_core::providers::BoxFuture<'a, Result<(), SecretError>> {
+            Box::pin(async { Err(SecretError::Locked) })
+        }
+    }
+
+    /// A keyring whose first delete parks until the test releases it, so a removal can
+    /// be held deterministically inside its post-success cleanup window.
+    #[derive(Debug)]
+    struct GatedDeleteSecrets {
+        handoff: mpsc::UnboundedSender<oneshot::Sender<()>>,
+        gated: std::sync::atomic::AtomicBool,
+    }
+
+    impl GatedDeleteSecrets {
+        fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<oneshot::Sender<()>>) {
+            let (handoff, entered) = mpsc::unbounded_channel();
+            (
+                Arc::new(Self {
+                    handoff,
+                    gated: std::sync::atomic::AtomicBool::new(false),
+                }),
+                entered,
+            )
+        }
+    }
+
+    impl Secrets for GatedDeleteSecrets {
+        fn get<'a>(
+            &'a self,
+            _kind: Kind,
+            _provider: &'a ProviderId,
+            _account: &'a AccountId,
+        ) -> highwater_core::providers::BoxFuture<'a, Result<Option<Credential>, SecretError>>
+        {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn set<'a>(
+            &'a self,
+            _kind: Kind,
+            _provider: &'a ProviderId,
+            _account: &'a AccountId,
+            _secret: &'a Credential,
+        ) -> highwater_core::providers::BoxFuture<'a, Result<(), SecretError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn compare_and_set<'a>(
+            &'a self,
+            _kind: Kind,
+            _provider: &'a ProviderId,
+            _account: &'a AccountId,
+            _expected: &'a Credential,
+            _replacement: &'a Credential,
+        ) -> highwater_core::providers::BoxFuture<'a, Result<bool, SecretError>> {
+            Box::pin(async { Ok(false) })
+        }
+
+        fn delete<'a>(
+            &'a self,
+            _kind: Kind,
+            _provider: &'a ProviderId,
+            _account: &'a AccountId,
+        ) -> highwater_core::providers::BoxFuture<'a, Result<(), SecretError>> {
+            if self.gated.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(async { Ok(()) });
+            }
+            let (release, released) = oneshot::channel();
+            let _ = self.handoff.send(release);
+            Box::pin(async {
+                released.await.expect("the test releases the first delete");
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cleanup_failure_after_a_durable_removal_still_reconciles_the_topology() {
+        let published = Published::default();
+        published.upsert(key_account("zai")).await;
+        let (commands, mut command_queue) = mpsc::channel(4);
+        let daemon = Arc::new(Daemon::new(
+            published,
+            PublishedUpdate::default(),
+            catalog(),
+            vec![("zai".into(), "default".into())],
+            commands,
+            Arc::new(FailingDeleteSecrets),
+        ));
+        let removing = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move { daemon.remove_provider("zai", "default").await }
+        });
+        let Command::RemoveProvider { reply, .. } =
+            tokio::time::timeout(std::time::Duration::from_secs(5), command_queue.recv())
+                .await
+                .expect("the removal reaches the engine before any keyring write")
+                .expect("the queue is alive")
+        else {
+            panic!("unexpected command");
+        };
+        reply
+            .send(Ok(Vec::new()))
+            .expect("caller waits for the durable removal");
+
+        let error = removing
+            .await
+            .expect("removal task did not panic")
+            .expect_err("the keyring failure is surfaced, not swallowed");
+        assert!(matches!(error, fdo::Error::Failed(_)));
+        assert!(
+            matches!(
+                daemon.account("zai", "default").await,
+                Err(fdo::Error::InvalidArgs(_))
+            ),
+            "the topology the engine persisted is authoritative even when cleanup failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_an_unconfigured_account_is_an_invalid_argument() {
+        let (daemon, _secrets, mut commands) = daemon_over_catalog(Vec::new(), catalog()).await;
+
+        let error = daemon
+            .remove_provider("zai", "default")
+            .await
+            .expect_err("the catalog alone is not a configured account");
+
+        assert!(matches!(error, fdo::Error::InvalidArgs(_)));
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn renaming_rejects_every_invalid_argument_before_the_engine_is_asked() {
+        let (daemon, _secrets, mut commands) = daemon_over_catalog(
+            vec![key_account("zai"), account_of("zai", "work")],
+            catalog(),
+        )
+        .await;
+
+        for (provider, account, new) in [
+            ("kimi", "work", "team"),
+            ("zai", "missing", "team"),
+            ("zai", "default", "team"),
+            ("zai", "work", "work"),
+            ("zai", "work", "team "),
+            ("zai", "work", "default"),
+        ] {
+            let error = daemon
+                .rename_account(provider, account, new)
+                .await
+                .expect_err(&format!(
+                    "renaming {provider}/{account} to {new} must be refused"
+                ));
+            assert!(
+                matches!(error, fdo::Error::InvalidArgs(_)),
+                "renaming {provider}/{account} to {new} is an argument error, not an engine failure"
+            );
+        }
+        assert!(
+            matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "no refused rename reaches the engine"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_migrates_through_the_engine_and_reconciles_the_configured_set() {
+        let (daemon, _secrets, mut commands) = daemon_over_catalog(
+            vec![key_account("zai"), account_of("zai", "work")],
+            catalog(),
+        )
+        .await;
+        let responder = tokio::spawn(async move {
+            let Command::RenameAccount {
+                provider,
+                account,
+                new,
+                reply,
+            } = commands.recv().await.expect("command")
+            else {
+                panic!("unexpected command");
+            };
+            assert_eq!(
+                (provider.as_str(), account.as_str(), new.as_str()),
+                ("zai", "work", "team")
+            );
+            reply
+                .send(Ok(vec![
+                    ("zai".into(), "default".into()),
+                    ("zai".into(), "team".into()),
+                ]))
+                .expect("caller waits");
+        });
+
+        daemon
+            .rename_account("zai", "work", "team")
+            .await
+            .expect("renamed");
+
+        assert!(
+            daemon.account("zai", "team").await.is_ok(),
+            "the configured set names the new id"
+        );
+        assert!(
+            matches!(
+                daemon.account("zai", "work").await,
+                Err(fdo::Error::InvalidArgs(_))
+            ),
+            "the retired id leaves the configured set with the reply's topology"
+        );
+        responder.await.expect("responder finished");
+    }
+
+    #[tokio::test]
+    async fn a_failed_rename_leaves_the_configured_set_alone() {
+        let (daemon, _secrets, mut commands) = daemon_over_catalog(
+            vec![key_account("zai"), account_of("zai", "work")],
+            catalog(),
+        )
+        .await;
+        let responder = tokio::spawn(async move {
+            let Command::RenameAccount { reply, .. } = commands.recv().await.expect("command")
+            else {
+                panic!("unexpected command");
+            };
+            reply
+                .send(Err("the settings file refused the write".to_owned()))
+                .expect("caller waits");
+        });
+
+        let error = daemon
+            .rename_account("zai", "work", "team")
+            .await
+            .expect_err("the engine refused the rename");
+        assert!(matches!(error, fdo::Error::Failed(_)));
+        assert!(
+            daemon.account("zai", "work").await.is_ok(),
+            "the old id stays configured when nothing became durable"
+        );
+        assert!(
+            matches!(
+                daemon.account("zai", "team").await,
+                Err(fdo::Error::InvalidArgs(_))
+            ),
+            "the new id never entered the configured set"
+        );
+        responder.await.expect("responder finished");
+    }
+
+    #[tokio::test]
+    async fn a_rename_holds_the_providers_mutation_locks_until_it_finishes() {
+        let (daemon, _secrets, mut commands) = daemon_over_catalog(
+            vec![key_account("zai"), account_of("zai", "work")],
+            catalog(),
+        )
+        .await;
+        let daemon = Arc::new(daemon);
+        let (rename_seen, rename_reached_engine) = tokio::sync::oneshot::channel();
+        let (finish_rename, release_engine_reply) = tokio::sync::oneshot::channel();
+        let responder = tokio::spawn(async move {
+            let Command::RenameAccount { reply, .. } = commands.recv().await.expect("command")
+            else {
+                panic!("unexpected command");
+            };
+            rename_seen.send(()).expect("test is waiting");
+            let _ = release_engine_reply.await;
+            reply
+                .send(Ok(vec![
+                    ("zai".into(), "default".into()),
+                    ("zai".into(), "team".into()),
+                ]))
+                .expect("caller waits");
+            commands
+        });
+        let renaming = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move { daemon.rename_account("zai", "work", "team").await }
+        });
+        rename_reached_engine
+            .await
+            .expect("the rename reached the engine holding every account's lock");
+
+        // A credential stored under the id being retired while the migration is in
+        // flight is the write it would lose.
+        let setting = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move { daemon.set_key("zai", "work", "too-late").await }
+        });
+        for _ in 0..10 {
+            if setting.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !setting.is_finished(),
+            "a credential mutation for the renamed id serializes against the rename"
+        );
+
+        finish_rename.send(()).expect("responder waits");
+        renaming
+            .await
+            .expect("rename task did not panic")
+            .expect("engine accepted the rename");
+        let error = setting
+            .await
+            .expect("credential task did not panic")
+            .expect_err("the retired id is gone from the configured set");
+        assert!(matches!(error, fdo::Error::InvalidArgs(_)));
+        let mut commands = responder.await.expect("responder finished");
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_rename_cancels_a_pending_login_for_the_retired_id() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let (daemon, _secrets, mut commands) = daemon_over_catalog(
+            vec![key_account("zai"), account_of("zai", "work")],
+            catalog(),
+        )
+        .await;
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = Arc::clone(&dropped);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = Dropped(task_dropped);
+            started.send(()).expect("test is waiting");
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        ready.await.expect("pending task started");
+        daemon
+            .logins
+            .lock()
+            .await
+            .insert(key("zai", "work"), Pending::new(task));
+        let responder = tokio::spawn(async move {
+            let Command::RenameAccount { reply, .. } = commands.recv().await.expect("command")
+            else {
+                panic!("unexpected command");
+            };
+            reply
+                .send(Ok(vec![
+                    ("zai".into(), "default".into()),
+                    ("zai".into(), "team".into()),
+                ]))
+                .expect("caller waits");
+        });
+
+        daemon
+            .rename_account("zai", "work", "team")
+            .await
+            .expect("renamed");
+        for _ in 0..10 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(dropped.load(Ordering::SeqCst), "the login task was aborted");
+        assert!(daemon.logins.lock().await.is_empty());
+        responder.await.expect("responder finished");
+    }
+
+    #[tokio::test]
+    async fn removing_an_account_cancels_its_pending_login() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let (daemon, _secrets, mut commands) =
+            daemon_over_catalog(vec![oauth_account("zai")], catalog()).await;
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = Arc::clone(&dropped);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = Dropped(task_dropped);
+            started.send(()).expect("test is waiting");
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        ready.await.expect("pending task started");
+        daemon
+            .logins
+            .lock()
+            .await
+            .insert(key("zai", "default"), Pending::new(task));
+        let responder = tokio::spawn(async move {
+            let Command::RemoveProvider { reply, .. } = commands.recv().await.expect("command")
+            else {
+                panic!("unexpected command");
+            };
+            reply.send(Ok(Vec::new())).expect("caller waits");
+        });
+
+        daemon
+            .remove_provider("zai", "default")
+            .await
+            .expect("removed");
+        for _ in 0..10 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(dropped.load(Ordering::SeqCst), "the login task was aborted");
+        assert!(daemon.logins.lock().await.is_empty());
+        responder.await.expect("responder finished");
+    }
+
+    #[tokio::test]
+    async fn a_promoting_removal_cancels_every_pending_login_of_the_provider() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let mut work = oauth_account("zai");
+        work.account = "work".into();
+        let (daemon, _secrets, mut commands) =
+            daemon_over_catalog(vec![oauth_account("zai"), work], catalog()).await;
+        let pending = || {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&dropped);
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _guard = Dropped(flag);
+                started.send(()).expect("test is waiting");
+                std::future::pending::<()>().await;
+                Ok(())
+            });
+            (dropped, task, ready)
+        };
+        let (default_dropped, default_task, default_ready) = pending();
+        let (work_dropped, work_task, work_ready) = pending();
+        default_ready.await.expect("default login started");
+        work_ready.await.expect("work login started");
+        {
+            let mut logins = daemon.logins.lock().await;
+            logins.insert(key("zai", "default"), Pending::new(default_task));
+            logins.insert(key("zai", "work"), Pending::new(work_task));
+        }
+        let responder = tokio::spawn(async move {
+            let Command::RemoveProvider { reply, .. } = commands.recv().await.expect("command")
+            else {
+                panic!("unexpected command");
+            };
+            reply
+                .send(Ok(vec![("zai".into(), "default".into())]))
+                .expect("caller waits");
+        });
+
+        daemon
+            .remove_provider("zai", "default")
+            .await
+            .expect("removed");
+        for _ in 0..10 {
+            if work_dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            default_dropped.load(Ordering::SeqCst),
+            "the removed account's login was aborted"
+        );
+        assert!(
+            work_dropped.load(Ordering::SeqCst),
+            "a login keyed by the promoted account's old id would commit a token under an \
+             id no configured account reads"
+        );
+        assert!(daemon.logins.lock().await.is_empty());
+        responder.await.expect("responder finished");
+    }
+
+    #[tokio::test]
+    async fn a_login_for_an_id_the_new_topology_drops_is_cancelled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let mut work = oauth_account("zai");
+        work.account = "work".into();
+        let (daemon, _secrets, mut commands) =
+            daemon_over_catalog(vec![oauth_account("zai"), work], catalog()).await;
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&dropped);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = Dropped(flag);
+            started.send(()).expect("test is waiting");
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        ready.await.expect("pending task started");
+        daemon
+            .logins
+            .lock()
+            .await
+            .insert(key("zai", "work"), Pending::new(task));
+        let responder = tokio::spawn(async move {
+            let Command::RemoveProvider { reply, .. } = commands.recv().await.expect("command")
+            else {
+                panic!("unexpected command");
+            };
+            // The engine's answer drops the whole provider, `work` included.
+            reply.send(Ok(Vec::new())).expect("caller waits");
+        });
+
+        daemon
+            .remove_provider("zai", "default")
+            .await
+            .expect("removed");
+        for _ in 0..10 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "no pending login may outlive the topology the engine just answered with"
+        );
+        assert!(daemon.logins.lock().await.is_empty());
+        responder.await.expect("responder finished");
+    }
+
+    #[tokio::test]
+    async fn a_stored_key_lands_in_the_keyring_and_wakes_the_poll_loop() {
+        let (daemon, secrets, mut commands) = daemon_over(vec![key_account("zai")]).await;
+
+        daemon
+            .set_key("zai", "default", "  sk-pasted-with-whitespace  ")
+            .await
+            .expect("a key is stored");
+
+        assert_eq!(
+            secrets.held(),
+            vec![(
+                "key".to_owned(),
+                "zai".to_owned(),
+                "default".to_owned(),
+                // Trimmed: a key copied out of a web page arrives with a newline on it,
+                // and a bearer token with trailing whitespace is a 401 nobody can explain.
+                "sk-pasted-with-whitespace".to_owned()
+            )]
+        );
+        assert!(matches!(
+            commands.try_recv().expect("the loop was told"),
+            Command::Reload { provider: Some(provider) } if provider == "zai"
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_empty_key_is_refused_rather_than_stored_as_one() {
+        let (daemon, secrets, _commands) = daemon_over(vec![key_account("zai")]).await;
+        assert!(daemon.set_key("zai", "default", "   ").await.is_err());
+        assert!(secrets.held().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_key_is_not_offered_to_a_provider_that_signs_in() {
+        let (daemon, secrets, _commands) = daemon_over(vec![oauth_account("claude")]).await;
+        assert!(daemon.set_key("claude", "default", "sk-1").await.is_err());
+        assert!(daemon.set_key("zai", "default", "sk-1").await.is_err());
+        assert!(secrets.held().is_empty());
+    }
+
+    #[tokio::test]
+    async fn signing_out_removes_the_credential_of_the_right_kind() {
+        let (daemon, secrets, mut commands) =
+            daemon_over(vec![key_account("zai"), oauth_account("claude")]).await;
+        daemon
+            .set_key("zai", "default", "sk-1")
+            .await
+            .expect("stored");
+        let _ = commands.try_recv();
+        secrets
+            .set(
+                Kind::Token,
+                &ProviderId::new("claude"),
+                &AccountId::default(),
+                &Credential::new("{}"),
+            )
+            .await
+            .expect("stored");
+
+        daemon
+            .sign_out("claude", "default")
+            .await
+            .expect("signed out");
+
+        assert_eq!(
+            secrets.held(),
+            vec![(
+                "key".to_owned(),
+                "zai".to_owned(),
+                "default".to_owned(),
+                "sk-1".to_owned()
+            )],
+            "signing out of one account must not take another account's key with it"
+        );
+        assert!(matches!(
+            commands.try_recv().expect("the loop was told"),
+            Command::Reload { provider: Some(provider) } if provider == "claude"
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_account_whose_credential_is_not_ours_has_nothing_to_sign_out_of() {
+        let mut external = status("antigravity");
+        external.credential = Some(CredentialKind::External.as_wire().to_owned());
+        let (daemon, _secrets, _commands) = daemon_over(vec![external]).await;
+        assert!(daemon.sign_out("antigravity", "default").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_setting_is_checked_against_the_choices_the_account_published() {
+        let mut zai = key_account("zai");
+        zai.options = vec![highwater_types::ProviderOption {
+            name: "region".into(),
+            title: "Region".into(),
+            description: None,
+            value: "global".into(),
+            choices: vec![highwater_types::OptionChoice {
+                value: "global".into(),
+                title: "Global".into(),
+            }],
+        }];
+        let (daemon, _secrets, _commands) = daemon_over(vec![zai]).await;
+
+        assert!(
+            daemon
+                .set_option("zai", "default", "region", "mars")
+                .await
+                .is_err(),
+            "a value no build knows how to read must not reach config.toml"
+        );
+        assert!(
+            daemon
+                .set_option("zai", "default", "colour", "green")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_valid_setting_is_serialized_through_the_engine() {
+        let mut zai = key_account("zai");
+        zai.options = vec![highwater_types::ProviderOption {
+            name: "region".into(),
+            title: "Region".into(),
+            description: None,
+            value: "global".into(),
+            choices: vec![
+                highwater_types::OptionChoice {
+                    value: "global".into(),
+                    title: "Global".into(),
+                },
+                highwater_types::OptionChoice {
+                    value: "bigmodel-cn".into(),
+                    title: "Mainland China".into(),
+                },
+            ],
+        }];
+        let (daemon, _secrets, mut commands) = daemon_over(vec![zai]).await;
+        let daemon = Arc::new(daemon);
+        let setting = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move {
+                daemon
+                    .set_option("zai", "default", "region", "bigmodel-cn")
+                    .await
+            }
+        });
+
+        let Command::SetOption {
+            provider,
+            account,
+            name,
+            value,
+            reply,
+        } = commands.recv().await.expect("setting reaches engine")
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(
+            (provider, account, name, value),
+            (
+                "zai".to_owned(),
+                "default".to_owned(),
+                "region".to_owned(),
+                "bigmodel-cn".to_owned()
+            )
+        );
+        assert!(!setting.is_finished(), "D-Bus waits for persistence");
+        reply.send(Ok(())).expect("caller waits for reply");
+        setting
+            .await
+            .expect("setting task did not panic")
+            .expect("engine accepted setting");
+    }
+
+    #[tokio::test]
+    async fn browser_auth_calls_are_serialized_through_the_engine_without_credentials() {
+        let cursor = status("cursor");
+        let (daemon, _secrets, mut commands) = daemon_over(vec![cursor]).await;
+        let daemon = Arc::new(daemon);
+        let inspection = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move { daemon.get_auth_sources("cursor", "default").await }
+        });
+
+        let Command::InspectAuthSources {
+            provider,
+            account,
+            reply,
+        } = commands.recv().await.expect("inspection reaches engine")
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(
+            (provider, account),
+            ("cursor".to_owned(), "default".to_owned())
+        );
+        reply
+            .send(Ok(vec![AuthCandidate {
+                id: "cursor-app".into(),
+                title: "Cursor App".into(),
+                subtitle: None,
+                state: "ready".into(),
+                children: Vec::new(),
+            }]))
+            .expect("report returned");
+        let sources = inspection
+            .await
+            .expect("inspection task did not panic")
+            .expect("inspection succeeds");
+        assert_eq!(sources[0].id, "cursor-app");
+        assert!(!format!("{sources:?}").contains("session="));
+
+        let selection = AuthSelection {
+            mode: "cursor-app".into(),
+            candidate: None,
+        };
+        let selecting = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            let selection = selection.clone();
+            async move {
+                daemon
+                    .select_auth_source("cursor", "default", selection)
+                    .await
+            }
+        });
+        let Command::SelectAuthSource {
+            provider,
+            account,
+            selection: requested,
+            reply,
+        } = commands.recv().await.expect("selection reaches engine")
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(
+            (provider, account, requested),
+            ("cursor".into(), "default".into(), selection)
+        );
+        reply.send(Ok(())).expect("selection completed");
+        selecting
+            .await
+            .expect("selection task did not panic")
+            .expect("selection succeeds");
+    }
+
+    #[tokio::test]
+    async fn an_order_that_is_not_the_configured_set_is_refused_before_the_engine() {
+        let (daemon, _secrets, mut commands) =
+            daemon_over(vec![key_account("zai"), key_account("kimi")]).await;
+
+        for order in [
+            vec!["zai".to_owned()],
+            vec!["zai".to_owned(), "zai".to_owned()],
+            vec!["zai".to_owned(), "kimi".to_owned(), "claude".to_owned()],
+        ] {
+            assert!(
+                daemon.set_order(order.clone()).await.is_err(),
+                "{order:?} is not the configured set"
+            );
+        }
+        assert!(
+            commands.try_recv().is_err(),
+            "a refused order never reaches the engine"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_valid_order_is_serialized_through_the_engine() {
+        let (daemon, _secrets, mut commands) =
+            daemon_over(vec![key_account("zai"), key_account("kimi")]).await;
+        let daemon = Arc::new(daemon);
+        let ordering = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move { daemon.set_order(vec!["kimi".into(), "zai".into()]).await }
+        });
+
+        let Command::SetOrder { providers, reply } =
+            commands.recv().await.expect("order reaches engine")
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(providers, ["kimi", "zai"]);
+        assert!(!ordering.is_finished(), "D-Bus waits for persistence");
+        reply.send(Ok(())).expect("caller waits for reply");
+        ordering
+            .await
+            .expect("ordering task did not panic")
+            .expect("engine accepted the order");
+    }
+
+    #[tokio::test]
+    async fn an_account_order_that_is_not_a_permutation_is_refused_before_the_engine() {
+        let (daemon, _secrets, mut commands) = daemon_over_catalog(
+            vec![key_account("zai"), account_of("zai", "work")],
+            catalog(),
+        )
+        .await;
+
+        for order in [
+            vec!["default".to_owned()],
+            vec!["default".to_owned(), "default".to_owned()],
+            vec!["default".to_owned(), "work".to_owned(), "extra".to_owned()],
+            Vec::new(),
+        ] {
+            assert!(
+                daemon
+                    .set_account_order("zai", order.clone())
+                    .await
+                    .is_err(),
+                "{order:?} is not the configured account set"
+            );
+        }
+        assert!(
+            commands.try_recv().is_err(),
+            "a refused order never reaches the engine"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_order_for_an_unconfigured_provider_is_refused() {
+        let (daemon, _secrets, mut commands) =
+            daemon_over_catalog(vec![key_account("zai")], catalog()).await;
+
+        assert!(
+            daemon
+                .set_account_order("kimi", vec!["default".into()])
+                .await
+                .is_err()
+        );
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_valid_account_order_is_serialized_through_the_engine() {
+        let (daemon, _secrets, mut commands) = daemon_over_catalog(
+            vec![key_account("zai"), account_of("zai", "work")],
+            catalog(),
+        )
+        .await;
+        let daemon = Arc::new(daemon);
+        // `work` first is a permutation of the configured set; whether the default must
+        // lead is the engine's rule to enforce, not a reason to reject the call here.
+        let ordering = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move {
+                daemon
+                    .set_account_order("zai", vec!["work".into(), "default".into()])
+                    .await
+            }
+        });
+
+        let Command::SetAccountOrder {
+            provider,
+            accounts,
+            reply,
+        } = tokio::time::timeout(std::time::Duration::from_secs(5), commands.recv())
+            .await
+            .expect("order reaches engine")
+            .expect("the queue is alive")
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(provider, "zai");
+        assert_eq!(accounts, ["work", "default"]);
+        assert!(!ordering.is_finished(), "D-Bus waits for persistence");
+        reply.send(Ok(())).expect("caller waits for reply");
+        ordering
+            .await
+            .expect("ordering task did not panic")
+            .expect("engine accepted the order");
+    }
+
+    #[tokio::test]
+    async fn awaiting_a_login_nobody_started_says_so() {
+        let (daemon, _secrets, _commands) = daemon_over(vec![oauth_account("claude")]).await;
+        assert!(daemon.await_login("claude", "default").await.is_err());
+        // Cancelling one is not an error, so a dialog closing does not have to know.
+        assert!(daemon.cancel_login("claude", "default").await.is_ok());
+    }
+
+    /// The bus name the test daemon owns. Not the real one: a developer's session usually
+    /// has a real `highwaterd` running on it, and a test must not fight it for the name.
+    const TEST_BUS_NAME: &str = "io.github.kakadon000.Highwater.DaemonTest";
+
+    async fn serve(daemon: Daemon) -> zbus::Result<zbus::Connection> {
+        zbus::connection::Builder::session()?
+            .name(TEST_BUS_NAME)?
+            .serve_at(ids::OBJECT_PATH, daemon)?
+            .build()
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_refresh_for_an_unconfigured_provider_is_an_error_rather_than_silence() {
+        let published = Published::default();
+        published.upsert(status("zai")).await;
+        let (tx, mut rx) = mpsc::channel(4);
+        let daemon = Daemon::new(
+            published,
+            PublishedUpdate::default(),
+            Vec::new(),
+            vec![("zai".into(), "default".into())],
+            tx,
+            Arc::new(FakeSecrets::default()),
+        );
+
+        assert!(
+            daemon.refresh("codex").await.is_err(),
+            "a typo must be visible"
+        );
+        assert!(daemon.refresh("zai").await.is_ok());
+        assert!(matches!(
+            rx.try_recv().expect("the loop was told"),
+            Command::Refresh(Some(provider)) if provider == "zai"
+        ));
+
+        assert!(
+            daemon.refresh("").await.is_ok(),
+            "an empty slug means everything"
+        );
+        assert!(matches!(
+            rx.try_recv().expect("the loop was told"),
+            Command::Refresh(None)
+        ));
+    }
+
+    /// Talks to the interface the way `busctl`, the GUI and any future CLI will: over a
+    /// real session bus, with nothing of ours on the client side but the wire types.
+    ///
+    /// Skipped rather than failed where no bus is reachable, on the same principle as the
+    /// Secret Service tests in `highwater-core`: a headless checkout must still build.
+    #[tokio::test]
+    async fn a_client_reads_the_daemon_over_a_real_session_bus() {
+        use std::pin::pin;
+        use std::time::Duration;
+        use zbus::export::futures_core::Stream;
+        use zbus::{MatchRule, MessageStream};
+
+        let published = Published::default();
+        published.upsert(status("zai")).await;
+        let published_update = PublishedUpdate::default();
+        published_update.set_enabled(true).await;
+        assert_eq!(
+            published_update
+                .publish(Some(Release::new("0.2.0", "## What's Changed\n* a fix")))
+                .await,
+            Some("0.2.0".into())
+        );
+        let (commands, mut command_queue) = mpsc::channel(4);
+
+        let Ok(server) = serve(Daemon::new(
+            published,
+            published_update.clone(),
+            Vec::new(),
+            vec![("zai".into(), "default".into())],
+            commands,
+            Arc::new(FakeSecrets::default()),
+        ))
+        .await
+        else {
+            eprintln!("skipped: no session bus reachable");
+            return;
+        };
+        let client = zbus::Connection::session()
+            .await
+            .expect("the server connected, so the client can too");
+
+        let call = async |method: &str, argument: &str| {
+            client
+                .call_method(
+                    Some(TEST_BUS_NAME),
+                    ids::OBJECT_PATH,
+                    Some(ids::DAEMON_INTERFACE),
+                    method,
+                    &argument,
+                )
+                .await
+        };
+
+        let reply = client
+            .call_method(
+                Some(TEST_BUS_NAME),
+                ids::OBJECT_PATH,
+                Some(ids::DAEMON_INTERFACE),
+                "GetStatus",
+                &(),
+            )
+            .await
+            .expect("GetStatus answers");
+        let statuses: Vec<ProviderStatus> = reply
+            .body()
+            .deserialize()
+            .expect("the published shape decodes on the other side of the bus");
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].provider, "zai");
+        assert_eq!(statuses[0].state, "pending");
+
+        let reply = client
+            .call_method(
+                Some(TEST_BUS_NAME),
+                ids::OBJECT_PATH,
+                Some(ids::DAEMON_INTERFACE),
+                "GetUpdate",
+                &(),
+            )
+            .await
+            .expect("GetUpdate answers");
+        let update: String = reply
+            .body()
+            .deserialize()
+            .expect("the available version is a string");
+        assert_eq!(update, "0.2.0");
+
+        let reply = client
+            .call_method(
+                Some(TEST_BUS_NAME),
+                ids::OBJECT_PATH,
+                Some(ids::DAEMON_INTERFACE),
+                "GetReleaseNotes",
+                &(),
+            )
+            .await
+            .expect("GetReleaseNotes answers");
+        let notes: String = reply
+            .body()
+            .deserialize()
+            .expect("the release notes are a string");
+        assert_eq!(notes, "## What's Changed\n* a fix");
+
+        call("Refresh", "zai")
+            .await
+            .expect("a known provider refreshes");
+        assert!(
+            matches!(
+                command_queue.recv().await,
+                Some(Command::Refresh(Some(provider))) if provider == "zai"
+            ),
+            "the call reached the poll loop"
+        );
+        assert!(
+            call("Refresh", "codex").await.is_err(),
+            "and an unconfigured one comes back as a D-Bus error"
+        );
+
+        let rule = MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .interface(ids::DAEMON_INTERFACE)
+            .expect("a valid interface name")
+            .member("UpdateChanged")
+            .expect("a valid member name")
+            .build();
+        let update_signals = MessageStream::for_match_rule(rule, &client, Some(4))
+            .await
+            .expect("the bus accepts the update match rule");
+        let mut update_signals = pin!(update_signals);
+        let emitter = SignalEmitter::new(&server, ids::OBJECT_PATH).expect("a valid path");
+
+        assert!(published_update.set_enabled(false).await);
+        Daemon::update_changed(&emitter, "")
+            .await
+            .expect("the update signal goes out");
+        let next = std::future::poll_fn(|cx| update_signals.as_mut().poll_next(cx));
+        let received = tokio::time::timeout(Duration::from_secs(5), next)
+            .await
+            .expect("the update signal arrives")
+            .expect("the stream is alive")
+            .expect("the message is well formed");
+        let carried: String = received
+            .body()
+            .deserialize()
+            .expect("the update signal carries a string");
+        assert_eq!(carried, "");
+        let reply = client
+            .call_method(
+                Some(TEST_BUS_NAME),
+                ids::OBJECT_PATH,
+                Some(ids::DAEMON_INTERFACE),
+                "GetUpdate",
+                &(),
+            )
+            .await
+            .expect("GetUpdate still answers after the signal");
+        let update: String = reply
+            .body()
+            .deserialize()
+            .expect("the update stays a string");
+        assert_eq!(update, "", "state was cleared before the signal");
+
+        let rule = MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .interface(ids::DAEMON_INTERFACE)
+            .expect("a valid interface name")
+            .member("ProviderChanged")
+            .expect("a valid member name")
+            .build();
+        let signals = MessageStream::for_match_rule(rule, &client, Some(4))
+            .await
+            .expect("the bus accepts the match rule");
+        let mut signals = pin!(signals);
+
+        let mut announced = status("zai");
+        announced.captured_at = Some(1_785_700_000);
+        Daemon::provider_changed(&emitter, announced)
+            .await
+            .expect("the signal goes out");
+
+        // `poll_next` by hand rather than pulling in `futures-util` for one call: the
+        // stream is what zbus hands us, and this crate has no other use for the trait.
+        let next = std::future::poll_fn(|cx| signals.as_mut().poll_next(cx));
+        let received = tokio::time::timeout(Duration::from_secs(5), next)
+            .await
+            .expect("the signal arrives")
+            .expect("the stream is alive")
+            .expect("the message is well formed");
+        let carried: ProviderStatus = received
+            .body()
+            .deserialize()
+            .expect("a client parses the signal with the same code as GetStatus");
+        assert_eq!(carried.captured_at, Some(1_785_700_000));
+
+        let rule = MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .interface(ids::DAEMON_INTERFACE)
+            .expect("a valid interface name")
+            .member("ProviderRemoved")
+            .expect("a valid member name")
+            .build();
+        let removals = MessageStream::for_match_rule(rule, &client, Some(4))
+            .await
+            .expect("the bus accepts the match rule");
+        let mut removals = pin!(removals);
+
+        Daemon::provider_removed(&emitter, "zai", "default")
+            .await
+            .expect("the removal signal goes out");
+        let next = std::future::poll_fn(|cx| removals.as_mut().poll_next(cx));
+        let received = tokio::time::timeout(Duration::from_secs(5), next)
+            .await
+            .expect("the signal arrives")
+            .expect("the stream is alive")
+            .expect("the message is well formed");
+        let carried: (String, String) = received
+            .body()
+            .deserialize()
+            .expect("a client parses the provider/account pair");
+        assert_eq!(carried, ("zai".into(), "default".into()));
+    }
+
+    #[tokio::test]
+    async fn a_notification_switch_is_serialized_through_the_engine() {
+        let mut zai = key_account("zai");
+        zai.windows = vec![highwater_types::WindowStatus {
+            key: "w18000".into(),
+            title: "5 hours".into(),
+            subtitle: None,
+            used_percent: 42.0,
+            resets_at: None,
+            length_secs: Some(18_000),
+            blocked_by: None,
+        }];
+        let (daemon, _secrets, mut commands) = daemon_over(vec![zai]).await;
+        let daemon = Arc::new(daemon);
+        let switching = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move {
+                daemon
+                    .set_window_notify("zai", "default", "w18000", true)
+                    .await
+            }
+        });
+
+        let Command::SetWindowNotify {
+            provider,
+            account,
+            window,
+            enabled,
+            reply,
+        } = commands.recv().await.expect("switch reaches engine")
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(
+            (provider, account, window, enabled),
+            (
+                "zai".to_owned(),
+                "default".to_owned(),
+                "w18000".to_owned(),
+                true
+            )
+        );
+        assert!(!switching.is_finished(), "D-Bus waits for persistence");
+        reply.send(Ok(())).expect("caller waits for reply");
+        switching
+            .await
+            .expect("switch task did not panic")
+            .expect("engine accepted the switch");
+    }
+
+    #[tokio::test]
+    async fn a_notification_switch_for_an_unconfigured_account_is_an_error() {
+        let (daemon, _secrets, _commands) = daemon_over(vec![key_account("zai")]).await;
+        assert!(
+            daemon
+                .set_window_notify("codex", "default", "w18000", true)
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn application_preferences_and_data_are_read_from_the_daemons_paths() {
+        let config_path = std::env::temp_dir().join(format!(
+            "highwater-service-preferences-{}.toml",
+            std::process::id()
+        ));
+        let history_path = std::env::temp_dir().join(format!(
+            "highwater-service-history-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_file(&history_path);
+        let mut config = Config::at(config_path.clone()).expect("empty config");
+        config.set_release_check(false).expect("configured");
+        std::fs::write(&history_path, [0_u8; 32]).expect("history fixture");
+
+        let (commands, _queue) = mpsc::channel(4);
+        let (release_checks, _release_changes) = watch::channel(false);
+        let daemon = Daemon::new(
+            Published::default(),
+            PublishedUpdate::default(),
+            Vec::new(),
+            Vec::new(),
+            commands,
+            Arc::new(FakeSecrets::default()),
+        )
+        .with_preferences(
+            config_path.clone(),
+            history_path.clone(),
+            Arc::new(crate::startup::System),
+            release_checks,
+            true,
+        );
+
+        assert!(
+            !daemon
+                .get_preferences()
+                .await
+                .expect("preferences")
+                .release_check
+        );
+        let data = daemon.get_data_info().await.expect("data");
+        assert_eq!(data.config_path, config_path.to_string_lossy());
+        assert_eq!(data.history_path, history_path.to_string_lossy());
+        assert_eq!(data.history_bytes, 32);
+        assert!(data.release_check_available);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_file(history_path);
+    }
+
+    #[tokio::test]
+    async fn a_preference_change_waits_for_the_engine_result() {
+        let (daemon, _secrets, mut commands) = daemon_over(Vec::new()).await;
+        let daemon = Arc::new(daemon);
+        let changing = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move {
+                daemon
+                    .preference_request(Preference::MinimizeOnClose(false))
+                    .await
+            }
+        });
+
+        let Command::SetPreference { preference, reply } =
+            commands.recv().await.expect("preference reaches engine")
+        else {
+            panic!("unexpected command");
+        };
+        assert!(matches!(preference, Preference::MinimizeOnClose(false)));
+        assert!(!changing.is_finished(), "D-Bus waits for persistence");
+        let preferences = Preferences {
+            minimize_on_close: false,
+            ..Default::default()
+        };
+        reply
+            .send(Ok(preferences.clone()))
+            .expect("caller waits for reply");
+        assert_eq!(
+            changing
+                .await
+                .expect("task did not panic")
+                .expect("accepted"),
+            preferences
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_startup_integration_restores_the_previous_mode() {
+        let config_path = std::env::temp_dir().join(format!(
+            "highwater-service-startup-rollback-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&config_path);
+        let startup = Arc::new(FakeStartup::failing_once());
+        let (commands, _queue) = mpsc::channel(1);
+        let (release_checks, _release_changes) = watch::channel(true);
+        let daemon = Daemon::new(
+            Published::default(),
+            PublishedUpdate::default(),
+            Vec::new(),
+            Vec::new(),
+            commands,
+            Arc::new(FakeSecrets::default()),
+        )
+        .with_preferences(
+            config_path.clone(),
+            config_path.with_extension("db"),
+            startup.clone(),
+            release_checks,
+            true,
+        );
+
+        assert!(
+            daemon
+                .change_startup_mode(Preferences::STARTUP_DAEMON)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            startup.attempts(),
+            vec![
+                Preferences::STARTUP_DAEMON.to_owned(),
+                Preferences::STARTUP_APP.to_owned()
+            ]
+        );
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_startup_preference_restores_the_previous_integration() {
+        let config_path = std::env::temp_dir().join(format!(
+            "highwater-service-startup-persistence-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&config_path);
+        let startup = Arc::new(FakeStartup::default());
+        let (commands, mut queue) = mpsc::channel(1);
+        let (release_checks, _release_changes) = watch::channel(true);
+        let daemon = Arc::new(
+            Daemon::new(
+                Published::default(),
+                PublishedUpdate::default(),
+                Vec::new(),
+                Vec::new(),
+                commands,
+                Arc::new(FakeSecrets::default()),
+            )
+            .with_preferences(
+                config_path.clone(),
+                config_path.with_extension("db"),
+                startup.clone(),
+                release_checks,
+                true,
+            ),
+        );
+        let changing = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move {
+                daemon
+                    .change_startup_mode(Preferences::STARTUP_DAEMON)
+                    .await
+            }
+        });
+
+        let Command::SetPreference { preference, reply } = queue
+            .recv()
+            .await
+            .expect("startup preference reaches engine")
+        else {
+            panic!("unexpected command");
+        };
+        assert!(matches!(
+            &preference,
+            Preference::StartupMode(mode) if mode == Preferences::STARTUP_DAEMON
+        ));
+        reply
+            .send(Err("simulated config failure".into()))
+            .expect("caller waits for reply");
+
+        assert!(changing.await.expect("task did not panic").is_err());
+        assert_eq!(
+            startup.attempts(),
+            vec![
+                Preferences::STARTUP_DAEMON.to_owned(),
+                Preferences::STARTUP_APP.to_owned()
+            ]
+        );
+        let _ = std::fs::remove_file(config_path);
+    }
+    /// The mutation lock is held from the commit to the `PreferencesChanged` that carries
+    /// it: a second mutation must not be able to commit while an older snapshot is still
+    /// unpublished, or clients can see the older state after the newer one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_startup_change_holds_the_mutation_guard_until_it_has_published() {
+        let Ok(connection) = zbus::Connection::session().await else {
+            eprintln!("skipped: no session bus reachable");
+            return;
+        };
+        for round in 0..4 {
+            let emitter = SignalEmitter::new(&connection, ids::OBJECT_PATH).expect("a valid path");
+            let flood_emitter =
+                SignalEmitter::new(&connection, ids::OBJECT_PATH).expect("a valid path");
+            let config_path = std::env::temp_dir().join(format!(
+                "highwater-service-startup-order-{round}-{}.toml",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&config_path);
+            let (commands, mut queue) = mpsc::channel(2);
+            let (release_checks, _changes) = watch::channel(true);
+            let daemon = Arc::new(
+                Daemon::new(
+                    Published::default(),
+                    PublishedUpdate::default(),
+                    Vec::new(),
+                    Vec::new(),
+                    commands,
+                    Arc::new(FakeSecrets::default()),
+                )
+                .with_preferences(
+                    config_path.clone(),
+                    config_path.with_extension("db"),
+                    Arc::new(FakeStartup::default()),
+                    release_checks,
+                    true,
+                ),
+            );
+
+            let changing = {
+                let daemon = Arc::clone(&daemon);
+                tokio::spawn(async move {
+                    daemon
+                        .set_startup_mode(emitter, Preferences::STARTUP_DAEMON)
+                        .await
+                })
+            };
+            let Command::SetPreference { reply, .. } =
+                queue.recv().await.expect("the change reaches the engine")
+            else {
+                panic!("unexpected command");
+            };
+
+            // Every signal emission takes the process-wide single serial-number permit
+            // zbus hands out, so a crowd of concurrent emissions parks the publication
+            let flood = (0..400)
+                .map(|_| {
+                    let emitter = flood_emitter.clone();
+                    tokio::spawn(async move {
+                        let _ = Daemon::preferences_changed(&emitter, Preferences::default()).await;
+                    })
+                })
+                .collect::<Vec<_>>();
+            reply
+                .send(Ok(Preferences {
+                    startup_mode: Preferences::STARTUP_DAEMON.into(),
+                    ..Default::default()
+                }))
+                .expect("caller waits for reply");
+
+            // From the moment the engine has committed, the guard must stay held until
+            // the signal has gone out; a free lock while the change is still unfinished
+            // is an older snapshot still unpublished while a newer mutation could commit.
+            // The short wait after a catch only separates a real escape from the instant
+            // between a finished task's lock release and its completion flag.
+            let mut escaped = false;
+            for _ in 0..20_000 {
+                if let Ok(guard) = daemon.preference_mutation.try_lock() {
+                    drop(guard);
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    escaped = !changing.is_finished();
+                    break;
+                }
+                if changing.is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            for task in flood {
+                let _ = task.await;
+            }
+            changing
+                .await
+                .expect("task did not panic")
+                .expect("startup mode changed");
+            assert!(
+                !escaped,
+                "round {round}: publication left the mutation lock"
+            );
+            let _ = std::fs::remove_file(config_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_refresh_mode_is_refused_before_the_engine_hears_it() {
+        let (daemon, _secrets, mut commands) = daemon_over(Vec::new()).await;
+        let Ok(connection) = zbus::Connection::session().await else {
+            eprintln!("skipped: no session bus reachable");
+            return;
+        };
+        let emitter = SignalEmitter::new(&connection, ids::OBJECT_PATH).expect("a valid path");
+
+        assert!(matches!(
+            daemon.set_refresh_mode(emitter, "sometimes").await,
+            Err(fdo::Error::InvalidArgs(_))
+        ));
+        assert!(
+            commands.try_recv().is_err(),
+            "a refused value must not reach the engine"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_change_reaches_the_engine_and_publishes_the_dict() {
+        let (daemon, _secrets, mut commands) = daemon_over(Vec::new()).await;
+        let daemon = Arc::new(daemon);
+        let Ok(connection) = zbus::Connection::session().await else {
+            eprintln!("skipped: no session bus reachable");
+            return;
+        };
+        let emitter = SignalEmitter::new(&connection, ids::OBJECT_PATH).expect("a valid path");
+
+        let changing = {
+            let daemon = Arc::clone(&daemon);
+            tokio::spawn(async move { daemon.set_refresh_minutes(emitter, 30).await })
+        };
+        let Command::SetPreference { preference, reply } = commands
+            .recv()
+            .await
+            .expect("the change reaches the engine")
+        else {
+            panic!("unexpected command");
+        };
+        assert!(matches!(preference, Preference::RefreshMinutes(30)));
+        reply
+            .send(Ok(Preferences::default()))
+            .expect("caller waits for reply");
+        changing
+            .await
+            .expect("task did not panic")
+            .expect("accepted");
+    }
+
+    #[tokio::test]
+    async fn a_column_change_reaches_the_engine_and_publishes_the_dict() {
+        let (daemon, _secrets, mut commands) = daemon_over(Vec::new()).await;
+        let daemon = Arc::new(daemon);
+        let Ok(connection) = zbus::Connection::session().await else {
+            eprintln!("skipped: no session bus reachable");
+            return;
+        };
+        let emitter = SignalEmitter::new(&connection, ids::OBJECT_PATH).expect("a valid path");
+
+        let changing = {
+            let daemon = Arc::clone(&daemon);
+            let emitter = emitter.clone();
+            tokio::spawn(async move { daemon.set_columns_auto(emitter, false).await })
+        };
+        let Command::SetPreference { preference, reply } = commands
+            .recv()
+            .await
+            .expect("the change reaches the engine")
+        else {
+            panic!("unexpected command");
+        };
+        assert!(matches!(preference, Preference::ColumnsAuto(false)));
+        reply
+            .send(Ok(Preferences::default()))
+            .expect("caller waits for reply");
+        changing
+            .await
+            .expect("task did not panic")
+            .expect("accepted");
+
+        let changing = {
+            let daemon = Arc::clone(&daemon);
+            tokio::spawn(async move { daemon.set_max_columns(emitter, 7).await })
+        };
+        let Command::SetPreference { preference, reply } = commands
+            .recv()
+            .await
+            .expect("the change reaches the engine")
+        else {
+            panic!("unexpected command");
+        };
+        assert!(matches!(preference, Preference::MaxColumns(7)));
+        reply
+            .send(Ok(Preferences::default()))
+            .expect("caller waits for reply");
+        changing
+            .await
+            .expect("task did not panic")
+            .expect("accepted");
+    }
+
+    #[tokio::test]
+    async fn a_zero_column_ceiling_is_refused_before_the_engine_hears_it() {
+        let (daemon, _secrets, mut commands) = daemon_over(Vec::new()).await;
+        let Ok(connection) = zbus::Connection::session().await else {
+            eprintln!("skipped: no session bus reachable");
+            return;
+        };
+        let emitter = SignalEmitter::new(&connection, ids::OBJECT_PATH).expect("a valid path");
+
+        assert!(matches!(
+            daemon.set_max_columns(emitter, 0).await,
+            Err(fdo::Error::InvalidArgs(_))
+        ));
+        assert!(
+            commands.try_recv().is_err(),
+            "a refused value must not reach the engine"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_theme_change_reaches_the_engine_and_publishes_the_dict() {
+        let (daemon, _secrets, mut commands) = daemon_over(Vec::new()).await;
+        let daemon = Arc::new(daemon);
+        let Ok(connection) = zbus::Connection::session().await else {
+            eprintln!("skipped: no session bus reachable");
+            return;
+        };
+        let emitter = SignalEmitter::new(&connection, ids::OBJECT_PATH).expect("a valid path");
+
+        let changing = {
+            let daemon = Arc::clone(&daemon);
+            tokio::spawn(async move { daemon.set_theme(emitter, "dark").await })
+        };
+        let Command::SetPreference { preference, reply } = commands
+            .recv()
+            .await
+            .expect("the change reaches the engine")
+        else {
+            panic!("unexpected command");
+        };
+        assert!(matches!(preference, Preference::Theme(theme) if theme == "dark"));
+        reply
+            .send(Ok(Preferences::default()))
+            .expect("caller waits for reply");
+        changing
+            .await
+            .expect("task did not panic")
+            .expect("accepted");
+    }
+
+    /// One plugin definition as the interface publishes it.
+    fn plugin_info(id: &str) -> PluginInfo {
+        PluginInfo {
+            id: id.to_owned(),
+            name: "Acme AI".into(),
+            plugin_version: "1.0.0".into(),
+            method: "GET".into(),
+            api_key_header: "X-Acme-Key".into(),
+            api_key_prefix: String::new(),
+            has_mark: true,
+            mark_svg: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn inspecting_a_plugin_reaches_the_engine_and_returns_what_it_declares() {
+        let (daemon, _secrets, mut commands) = daemon_over(Vec::new()).await;
+        let daemon = Arc::new(daemon);
+        let inspecting = {
+            let daemon = Arc::clone(&daemon);
+            tokio::spawn(async move { daemon.inspect_plugin(b"a file".to_vec()).await })
+        };
+
+        let Command::InspectPlugin { bytes, reply } =
+            commands.recv().await.expect("the file reaches the engine")
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(bytes, b"a file");
+        reply
+            .send(Ok(plugin_info("com.acme.quota")))
+            .expect("caller waits for reply");
+        let info = inspecting
+            .await
+            .expect("task did not panic")
+            .expect("a valid file inspects");
+        assert_eq!(info.id, "com.acme.quota");
+        assert_eq!(info.api_key_header, "X-Acme-Key");
+        assert!(
+            daemon
+                .list_providers()
+                .await
+                .iter()
+                .all(|definition| definition.plugin.is_none()),
+            "inspection is a dry run: nothing became configurable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_plugin_file_is_an_invalid_argument_with_the_stage_named() {
+        let (daemon, _secrets, mut commands) = daemon_over(Vec::new()).await;
+        let daemon = Arc::new(daemon);
+        let inspecting = {
+            let daemon = Arc::clone(&daemon);
+            tokio::spawn(async move { daemon.inspect_plugin(b"a broken file".to_vec()).await })
+        };
+
+        let Command::InspectPlugin { reply, .. } =
+            commands.recv().await.expect("the file reaches the engine")
+        else {
+            panic!("unexpected command");
+        };
+        reply
+            .send(Err("parser.language: only lua54 is implemented".into()))
+            .expect("caller waits for reply");
+        let error = inspecting
+            .await
+            .expect("task did not panic")
+            .expect_err("an unknown parser language is refused");
+        assert!(
+            matches!(error, fdo::Error::InvalidArgs(_)),
+            "a bad file is the caller's argument, not the daemon's state: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("parser.language"),
+            "the stage is named: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn setting_an_endpoint_for_an_unconfigured_account_is_an_invalid_argument() {
+        let (daemon, _secrets, _commands) = daemon_over(Vec::new()).await;
+        let error = daemon
+            .set_plugin_endpoint("com.acme.quota", "work", "https://a.test/u", false)
+            .await
+            .expect_err("there is no such account");
+        assert!(matches!(error, fdo::Error::InvalidArgs(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_reaches_the_engine_for_a_configured_account() {
+        let (daemon, _secrets, mut commands) =
+            daemon_over(vec![key_account("com.acme.quota")]).await;
+        let daemon = Arc::new(daemon);
+        let setting = {
+            let daemon = Arc::clone(&daemon);
+            tokio::spawn(async move {
+                daemon
+                    .set_plugin_endpoint("com.acme.quota", "default", "https://a.test/u", true)
+                    .await
+            })
+        };
+
+        let Command::SetPluginEndpoint {
+            provider,
+            account,
+            endpoint,
+            allow_insecure_http,
+            reply,
+        } = commands
+            .recv()
+            .await
+            .expect("the endpoint reaches the engine")
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(
+            (provider, account, endpoint, allow_insecure_http),
+            (
+                "com.acme.quota".to_owned(),
+                "default".to_owned(),
+                "https://a.test/u".to_owned(),
+                true
+            )
+        );
+        assert!(!setting.is_finished(), "D-Bus waits for persistence");
+        reply.send(Ok(())).expect("caller waits for reply");
+        setting
+            .await
+            .expect("task did not panic")
+            .expect("the engine accepted it");
+    }
+
+    #[tokio::test]
+    async fn installing_a_plugin_republishes_the_catalog_and_announces_it() {
+        let (daemon, _secrets, mut commands) = daemon_over(Vec::new()).await;
+        let daemon = Arc::new(daemon);
+        let Ok(connection) = zbus::Connection::session().await else {
+            eprintln!("skipped: no session bus reachable");
+            return;
+        };
+        let emitter = SignalEmitter::new(&connection, ids::OBJECT_PATH).expect("a valid path");
+
+        let installing = {
+            let daemon = Arc::clone(&daemon);
+            tokio::spawn(async move { daemon.install_plugin(emitter, b"a file".to_vec()).await })
+        };
+        let Command::InstallPlugin { reply, .. } =
+            commands.recv().await.expect("the file reaches the engine")
+        else {
+            panic!("unexpected command");
+        };
+        let info = plugin_info("com.acme.quota");
+        let definition = ProviderDefinition {
+            provider: "com.acme.quota".into(),
+            title: "Acme AI".into(),
+            credential: "key".into(),
+            credential_hint: "Paste the API key Acme AI issues.".into(),
+            external: None,
+            browser_auth: None,
+            options: Vec::new(),
+            plugin: Some(info.clone()),
+        };
+        reply
+            .send(Ok((
+                info.clone(),
+                PluginChange {
+                    plugins: vec![info],
+                    catalog: vec![definition],
+                },
+            )))
+            .expect("caller waits for reply");
+        let installed = installing
+            .await
+            .expect("task did not panic")
+            .expect("the engine accepted it");
+        assert_eq!(installed.id, "com.acme.quota");
+        assert_eq!(
+            daemon
+                .list_providers()
+                .await
+                .iter()
+                .filter_map(|definition| definition.plugin.as_ref())
+                .map(|info| info.id.clone())
+                .collect::<Vec<_>>(),
+            ["com.acme.quota"],
+            "the catalog is replaced before the signal goes out"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_plugin_still_in_use_is_refused_by_the_engine() {
+        let (daemon, _secrets, mut commands) = daemon_over(Vec::new()).await;
+        let daemon = Arc::new(daemon);
+        let Ok(connection) = zbus::Connection::session().await else {
+            eprintln!("skipped: no session bus reachable");
+            return;
+        };
+        let emitter = SignalEmitter::new(&connection, ids::OBJECT_PATH).expect("a valid path");
+
+        let removing = {
+            let daemon = Arc::clone(&daemon);
+            tokio::spawn(async move { daemon.remove_plugin(emitter, "com.acme.quota").await })
+        };
+        let Command::RemovePlugin { provider, reply } = commands
+            .recv()
+            .await
+            .expect("the removal reaches the engine")
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(provider, "com.acme.quota");
+        reply
+            .send(Err(
+                "com.acme.quota still has 2 account(s) configured".into()
+            ))
+            .expect("caller waits for reply");
+        let error = removing
+            .await
+            .expect("task did not panic")
+            .expect_err("a definition in use is not removable");
+        assert!(error.to_string().contains("account"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_daemon_uses_its_captured_runtime_for_oauth_callbacks() {
+        let (daemon, _secrets, _commands) = daemon_over(Vec::new()).await;
+        let expected = tokio::runtime::Handle::current().id();
+        let actual = daemon
+            .runtime
+            .spawn(async { tokio::runtime::Handle::current().id() })
+            .await
+            .expect("the captured runtime is still running");
+
+        assert_eq!(actual, expected);
+    }
+}

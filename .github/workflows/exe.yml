@@ -1,0 +1,68 @@
+# On-demand Windows EXE build.
+#
+# Run it from the Actions tab (Run workflow) or rely on it automatically on every
+# push to `main`. It compiles the workspace on native MSVC and uploads the raw
+# executables — the window, the daemon, the CLI and the maintenance helper — as a
+# downloadable artifact. Tagged releases go through `release.yml`, which builds the
+# Inno setup instead; this workflow exists so nobody has to cut a tag just to hold
+# a fresh build.
+
+name: Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '*.md'
+      - '**/*.md'
+      - 'docs/**'
+      - 'site/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-exe-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  exe:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: MSVC toolchain
+        shell: pwsh
+        run: rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msvc-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build the workspace
+        shell: pwsh
+        run: |
+          . ./scripts/windows-env.ps1
+          cargo build --release --locked --workspace --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+
+      - name: Collect the executables
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build/windows/exe | Out-Null
+          foreach ($bin in 'highwater', 'highwaterd', 'highwaterctl', 'highwater-maintenance') {
+            Copy-Item "target/x86_64-pc-windows-msvc/release/$bin.exe" build/windows/exe/
+          }
+          Get-ChildItem build/windows/exe
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Highwater-windows-exe
+          path: build/windows/exe/*.exe
+          if-no-files-found: error

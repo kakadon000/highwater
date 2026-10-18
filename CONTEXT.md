@@ -1,0 +1,747 @@
+# Highwater
+
+A native Linux desktop app that tracks quota limits across AI providers — how much of
+each rate-limit window you have burned, when it resets, and whether your current pace
+will get you there.
+
+Docs are in English because the repo is public; conversation about it happens in Russian.
+
+## Why it exists
+
+Menu-bar quota trackers answer "what is my number right now". A separate window can
+answer the question that does not fit in a popup: **can I start a long run right now,
+and on which provider?** That question is comparative (five providers side by side) and
+temporal (not "how much did I spend" but "how long will it last"). Every design decision
+below follows from that.
+
+## Identity
+
+| | |
+|---|---|
+| Application ID / D-Bus name | `io.github.kakadon000.Highwater` |
+| Daemon bus name | `io.github.kakadon000.Highwater.Daemon` |
+| Object path | `/io/github/kakadon000/Highwater` |
+| D-Bus interface | `io.github.kakadon000.Highwater.Daemon1` |
+| GUI binary | `highwater` |
+| Daemon binary | `highwaterd` |
+| systemd user unit | `highwaterd.service` |
+| Config | `$XDG_CONFIG_HOME/highwater/config.toml` |
+| History | `$XDG_DATA_HOME/highwater/history.db` |
+| Secret Service schema, API keys | `io.github.kakadon000.Highwater.ProviderKey` |
+| Secret Service schema, our own logins | `io.github.kakadon000.Highwater.ProviderToken` |
+
+Reverse-DNS uses `io.github.kakadon000` because there is no owned domain. It is the
+conventional fallback and is what desktop files, D-Bus, and Flatpak all expect to match.
+
+## Vocabulary
+
+- **Provider** — one AI service (Claude, Codex, Z.ai, Kimi, Antigravity).
+- **Provider definition** — one entry in the catalog compiled into this build: its stable
+  slug, display metadata, authentication kind, and declared settings. The catalog says
+  what can be added; it does not say what the daemon currently polls.
+- **Configured account** — a catalog provider the user has added. v1 creates its single
+  `default` account and persists the provider slug in `config.toml`.
+- **Account** — one set of credentials for a provider. Every key in storage carries an
+  account id, which is also the name the card shows above the provider's own: it is the
+  name the user typed, in any script — letters, digits, spaces, hyphens and underscores,
+  beginning and ending on a letter or a digit, case kept. Nothing transliterates it, and
+  nothing downstream needs it to be ASCII: it is a TOML value in `accounts`, a quoted key
+  where a plugin's per-account table needs one, a bound SQLite parameter, a Secret Service
+  attribute and a D-Bus string. `default` is the provider's own structural first account
+  and stays unlabelled.
+- **Window** — one rate-limit period a provider reports: `{id, title, used_percent,
+  resets_at, length}`. A provider returns however many it wants; the set can change
+  between responses. Windows are first-class, not display strings — the pace mark and the
+  burn-down forecast are computed from `length` and `resets_at`.
+- **Segment** — one instance of a window between two resets. The unit that history is
+  grouped by, that notifications deduplicate against, and that a forecast is computed over.
+- **Snapshot** — one fetch result for a provider: a list of windows plus free-form
+  `details` sections (`{title, rows: [{label, value}]}`) for anything that does not fit
+  the window model, such as Kimi's absolute request counts or Codex reset credits.
+- **Pace** — the fraction of the window's duration that has elapsed. Displayed as a mark
+  on the bar at that position. Fill left of the mark means sustainable; fill right of it
+  means the quota runs out before the reset.
+
+A pace mark needs both a length and a reset time, and a provider may withhold either.
+**This is a normal state, not a failure.** Z.ai drops `nextResetTime` from a window that
+has just reset and has nothing spent in it — observed live — and the window it does that
+to is the five-hour one, which is the window the card leads with. Two of the five
+providers also report windows with no length at all. The bar must therefore have a
+defined appearance with no mark on it; inventing a length or a reset time to keep the mark
+on screen would put a confident wrong number in front of the user.
+
+## Providers in v1
+
+All five reach their data over tokens or a local server. None requires scraping browser
+cookies — a deliberate scope boundary, not a coincidence.
+
+| Provider | Path | Credential |
+|---|---|---|
+| Claude | OAuth token → usage API | `~/.claude/.credentials.json` (`claudeAiOauth`), or our own login |
+| Codex | `GET https://chatgpt.com/backend-api/wham/usage`, Bearer | `~/.codex/auth.json` (`tokens.access_token`), or our own login |
+| Z.ai / GLM | API token, Global or BigModel CN region | user-supplied key |
+| Kimi | `GET https://api.kimi.com/coding/v1/usages` | user-supplied key from Kimi Code Console |
+| Antigravity | Cloud Code Assist `retrieveUserQuotaSummary`, the same per-group summary the local `agy` server reports; optional local `agy` fallback | Highwater Google OAuth, or an existing `agy` session |
+
+Three of them have **two** credentials rather than one, and which of the two an account
+uses is the user's choice, not a rule hidden in the daemon. It is stored as
+`[provider.<slug>] source = "oauth" | "cli"`, published with the provider so a client can
+draw it without knowing what either credential is, and drawn in the authentication group
+as a two-part control — Highwater's own login on the left, the local program's on the right.
+A freshly added provider stores `source = "oauth"` before its first credential probe, so
+adding one never silently adopts a vendor CLI login; `auth select <slug> --mode cli` is the
+explicit opt-in. **A pinned credential that is not there is `no-credential`, never a quiet
+fall back to the other one**. An existing account whose `source` was never set keeps the
+legacy automatic rule, so this cutover does not switch an installed account.
+
+Codex reports `rate_limit.primary_window` / `secondary_window` — slots rather than lanes,
+each declaring its own length — plus a `code_review_rate_limit` of the same shape and named
+`additional_rate_limits[]`. The three are separate pools, not lengths of one. One extra
+pool is dropped rather than drawn: `metered_feature: "base_model_inference"`, shown by
+OpenAI as *gpt-reserve*, whose weekly window resets at `captured_at + 604800` on every
+poll and so measures nothing.
+Antigravity reports two model groups (Gemini, Claude+GPT) × two windows. "OpenAI" here
+means the ChatGPT/Codex subscription, not the API Platform billing dashboard — the latter
+has spend, not reset windows, and does not fit this model.
+
+Providers are a plugin point: adding one is a new implementation of the provider trait
+plus registration, not a refactor.
+
+## Architecture
+
+Daemon plus client, split over D-Bus.
+
+- **`highwaterd`** — systemd user unit. Owns polling, credential refresh, history, and
+  notifications. Runs whether or not the window is open, because a warning that only
+  arrives when you are already looking is not a warning.
+- **GUI** — a thin viewer. Never performs network I/O.
+- **CLI** — `highwaterctl`. The third client, and the one the interface was shaped for:
+  one round trip draws a window, a Waybar module, or a line of output.
+
+Language is Rust; the GUI is Slint with FemtoVG (OpenGL on Linux, wgpu on
+Direct3D 12 on Windows). Its palette and widgets live in `ui/theme.slint` and
+`ui/widgets.slint`; Rubik and UI icons are embedded at build time. Rust was chosen for
+packaging above all —
+`deb`/`rpm`/`PKGBUILD` from a single binary is the cheap path — and for `serde`, which
+turns "the provider silently changed their undocumented JSON" from a blank screen into a
+named field in an error.
+
+### Crate layout
+
+Six crates, and two of them exist to make a rule checkable rather than aspirational: the
+GUI never performs network I/O, and there is exactly one definition of the D-Bus contract.
+
+| crate | holds | must never reach |
+|---|---|---|
+| `highwater-types` | vocabulary, identity constants, D-Bus wire shapes | anything with I/O |
+| `highwater-ipc` | the generated D-Bus proxy | providers, storage, the display |
+| `highwater-core` | provider clients, history, secrets | Slint, winit, wgpu |
+| `highwaterd` | scheduler, D-Bus service, notifications | — |
+| `highwater` | the interface | `highwater-core`, HTTP, SQLite |
+| `highwater-cli` | `highwaterctl` | `highwater-core`, Slint, a runtime |
+
+The GUI depends on `highwater-types` and D-Bus only. Folding the vocabulary into
+`highwater-core` and feature-gating the network out of it does not work: Cargo unifies
+features across a workspace build, so the moment the daemon is built the GUI links the
+HTTP stack too. A separate crate is the only form of this rule the build actually
+enforces. `scripts/check-layering.sh` asserts it against `cargo tree`.
+
+### D-Bus interface
+
+The compiled provider catalog and configured accounts are separate D-Bus concepts.
+`ListProviders` returns every provider definition supported by this build. `GetStatus`
+returns only configured accounts — state, last good reading, how the account is
+authenticated, and when the next poll is due — so one round trip is enough to draw the
+whole window, or a Waybar module, or a line of CLI output. `AddProvider(provider)` creates
+and persists the provider's `default` account; `RemoveProvider(provider, account)` removes
+one. `ProviderChanged` carries the same status shape as `GetStatus` for an account that was
+added or updated, while `ProviderRemoved(provider, account)` tells long-running clients to
+drop its settings row and card. `SetOrder(providers)` rewrites the order the cards go in and
+`OrderChanged(providers)` announces it — a signal of its own rather than a burst of
+`ProviderChanged`, because a status carries no position: a client holding cards needs the
+sequence, not the readings again. `GetStatus` answers in that order from the moment it is
+emitted. `Refresh(provider)` polls now, with an empty string meaning everything, re-reads
+the credential on the way, and looks again for the vendor login a provider can read instead
+of ours — a refresh is what a user reaches for straight after running `claude` in a
+terminal. `Version` says what is on the other end.
+
+`GetUpdate` says whether a newer release was found and `UpdateChanged(version)` announces
+it; `GetReleaseNotes` returns that release's notes as its publisher wrote them — Markdown,
+unrendered. The notes are a separate call rather than a second field on the announcement
+because a client needs the version to decide whether to offer anything at all, and the
+notes only once a reader asks for them.
+
+Credentials are the daemon's, so changing them is the daemon's too: `SetKey`, `SignOut`,
+`SetOption`, `SetWindowNotify`, and the two halves of a login. Nothing there is specific to the GUI — a
+`busctl` line does the same thing — which is why it is on the interface rather than inside
+a dialog. **A login is two calls, because the work spans two processes.** `BeginLogin`
+takes the callback port, builds the authorize URL and returns it without waiting; the client
+opens that URL however its platform opens URLs; `AwaitLogin` blocks until the browser has
+come back and the tokens are stored. The daemon never opens a browser itself:
+it is a background service that may have started before the session had a display.
+
+Every published structure is a dictionary (`a{sv}`), not a fixed D-Bus struct. Two reasons,
+and the first is the same rule that governs the bar: **absent must stay absent.** D-Bus has
+no optional field, so a fixed signature would put a `0` where a provider said nothing about
+a reset time — measurably wrong, and the Z.ai five-hour window does exactly this in
+practice. The second is that adding a key must not break a client compiled against the
+older shape.
+
+Failure is part of the published shape, not an absence of it: an account carries a state —
+`ok`, `pending`, `no-credential`, `waiting-for-keyring`, `keyring-unavailable`,
+`credential-rejected`, `rate-limited`, `unreachable`, `malformed` — and keeps its **last
+good reading underneath it**. A failed poll changes the chip on the card, not the numbers;
+blanking a card because one request timed out would be less honest, not more.
+
+### Command line
+
+`highwaterctl` is the third client, and the reason the interface was shaped as it was.
+It generates its proxy from `highwater-ipc`, the same crate the window uses, so a method
+that changes shape breaks the build rather than a user's panel.
+
+Commands that act on one existing account default `--account` to `default`; a named
+account stays explicit. Collection commands are deliberately different: omitting the
+filter from `usage`, `guard` or `watch` continues to mean every matching account, which is
+the shape panel plugins need.
+
+Three output formats, and two of them are contracts. `text` is for a person and may be
+reworded. `json` is an object with an `accounts` key — not a bare array, so a key can be
+added later — carrying `ProviderStatus` as serde renders it, absent values still absent.
+`waybar` is `{text, tooltip, class, percentage}`, where `class` is **always an array** so
+its shape does not change when a second class applies: the zone (`ok`, `warning`, `danger`,
+at the same 70/90 the bar uses) and `stale` when the account's state is not `ok`.
+
+`watch` streams NDJSON: a `snapshot` first, then one line per signal, a `waiting` line when
+the daemon leaves the bus, and a fresh `snapshot` after every reconnect — what the daemon
+published while nothing was listening was announced to nobody.
+
+Exit codes are the point of `guard`: `0` safe, `1` below the threshold, `64` an argument
+this build cannot act on, `69` nothing trustworthy to judge, `70` the daemon refused. A
+command line clap itself rejects exits `2`, clap's own code. Only an `ok` account's reading
+is judged; a last-good number behind a rejected credential would otherwise say "safe"
+about quota nobody can spend.
+
+Secrets are read from stdin or `--key-file`, never from argv: `/proc/<pid>/cmdline` is
+readable by every process of the same user. stdin is a file descriptor rather than a
+terminal, so a plugin with its own UI writes into a pipe without opening a console.
+
+Windows is out of scope for the CLI: there the daemon serves zbus p2p over AF_UNIX, and the
+endpoint discovery lives in the window's own reconnect module. The binary still compiles
+there; it is packaged only on Linux.
+
+### Provider contract
+
+A provider knows its own identity and can produce a snapshot. The trait says nothing about
+credentials, because the five acquire them in five different ways — a key in the Secret
+Service, an OAuth token refreshed out of a third-party CLI's file, a local server holding
+its own session in the keyring — and any credential the trait named would fit at most two
+of them. Each provider owns its HTTP client for the same reason: Antigravity's talks to a
+loopback server with a self-signed certificate and needs an exception no other provider
+should be handed.
+
+Underneath the trait, every implementation splits **transport from meaning**: `fetch`
+performs the request and hands the body to a pure `parse(body, captured_at)`. All the
+traps live in the parsing — an unnamed unit enum, millisecond timestamps, numbers arriving
+as strings, remaining-instead-of-used — and none of them need a live key to get wrong.
+
+**A provider must never silently drop a window.** A window missing from the interface reads
+as "you have no such limit", which is the most dangerous thing this program can say. An
+entry of a kind we recognize but cannot parse fails the whole fetch. Only an entry of an
+*unrecognized* kind is skipped, because that is a quota type that did not exist when the
+parser was written rather than a failure to understand one that did.
+
+### User-installed providers
+
+A provider need not ship with Highwater. A `.highwater-provider` file — TOML metadata, a
+sandboxed Lua 5.4 transformation and an optional SVG mark — teaches one more endpoint to a
+running installation. `docs/plugin-providers.md` is the author-facing format; what follows
+is who owns which half of it.
+
+**highwater-core owns the file and the transformation.** Parsing and validating the file,
+sanitizing the mark, the sandbox and its limits, the pure `render(definition, body, account,
+captured_at)`, and the one generic single-request provider built on it. Nothing here reads
+the filesystem or decides where a request goes.
+
+**highwaterd owns the installation and the request.** The store of installed definitions
+(transactional: validated, then written staged-and-renamed, so a rejected replacement leaves
+the previous definition polling), the materialized mark, the endpoint the account owner
+typed, the key in the keyring, and the single HTTP request. The GUI and `highwaterctl` own
+neither: they publish and print what the daemon answers, and there is exactly one parser and
+one runtime, both in the daemon's half.
+
+The boundaries that make importing a stranger's file reasonable are ownership boundaries,
+not checks:
+
+- **The file cannot name a host.** There is no endpoint field in the format. The account
+  owner supplies the whole absolute URL, so a shared corporate definition is independent of
+  deployment topology and its author cannot choose where a recipient's key is sent.
+- **The key never enters Lua.** Not in `response`, not in `context`, not in a diagnostic.
+  A plugin is a pure function from a JSON document to a reading.
+- **Highwater owns the request.** One `GET` or empty-bodied `POST`, the key in the one
+  declared header, redirects off, the shared proxy policy, the response bound, and its own
+  `User-Agent` and `Accept` set last and by replacement.
+
+A plugin's provider id is a persistent storage key exactly as a built-in slug is: accounts,
+keys, history and notification preferences hang off it, replacement keeps them, and removal
+is refused while any account still uses it.
+
+### Local authentication sources
+
+Some providers hold no key at all — their credential is a session this machine
+already has. Cursor is the first: it reads cursor.com through either the Cursor
+App's local state or one browser's cookie store. Which of them answers is a
+recorded choice, not a scan: the daemon discovers every candidate, proves each
+with a real request, and records the pick (`auth-source`, plus `auth-browser`
+and `auth-profile` where they apply) beside the account's other options — the
+same way an OAuth-or-CLI choice is stored. The window sees titles and readiness
+states over D-Bus, never cookie values, tokens, or database paths.
+
+Three boundaries make this acceptable where blanket cookie-scraping would not be:
+
+- **The daemon owns all of it.** Browser storage is touched by highwaterd alone;
+  the GUI process renders published states and never learns how a credential is
+  stored.
+- **Snapshot reads.** A browser's cookie database is read through an owner-only
+  temporary copy; no browser directory is opened in place or written to.
+- **One recorded source, used exclusively.** A failing source fails the account,
+  and Highwater reports the gap rather than quietly switching to another browser
+  or the App — quota on screen must belong to the account the user chose.
+
+Browser slugs and profile identifiers are stable config keys for the same reason
+provider slugs are — not renamable once shipped.
+
+### API floor
+
+Slint **1.18**, drawn with FemtoVG — on OpenGL on Linux, on wgpu (Direct3D 12) on Windows — and
+pinned with `~` because the winit accessor the window frame uses is an unstable feature
+that may change in any minor release. Not Skia: its renderer hints each glyph while the
+text layout places glyphs at unhinted advances, so small text crowds and drifts. Not
+Vulkan on Linux: Wayland cannot hide a window, only destroy it, so a window brought back
+from the tray is a new surface, and NVIDIA's driver crashes creating its swapchain.
+
+The client links fontconfig and nothing else of the desktop's; winit and the renderer open
+the Wayland, X11, xkbcommon and EGL libraries with `dlopen`, so packaging names them by hand.
+
+The floor is *the newest we can test against*, not the oldest distribution we could
+theoretically reach. If a toolkit release would make the interface better, we take it, and
+the packaging targets follow the code rather than the other way round.
+
+On Linux, SQLite is the system library rather than a vendored copy, so the `deb` and `rpm` do not
+carry a bundled copy of a library the distribution already ships — `ldd` on the daemon
+shows `libsqlite3.so.0` from `/usr/lib`.
+
+Windows uses the native MSVC toolchain, bundled SQLite and a static CRT. The per-user
+Inno Setup 7 installer owns program-file transactions and shell integration; the
+daemon helper snapshots them and coordinates PID-specific shutdown/readiness events.
+The daemon flushes before the GUI closes its job. Setup preserves task/Run preferences
+and independent daemon ownership, while config, history and secrets stay outside the
+installer's ownership. Updates are manual. See `data/packaging/windows/README.md`.
+
+TLS is rustls, which keeps OpenSSL out of the link. It does **not** keep C out: rustls's
+default provider is `aws-lc-rs`, and `aws-lc-sys` vendors C and assembly compiled by the
+`cc` crate at build time. That has a packaging consequence, measured rather than predicted
+— those objects cannot be built with GCC's LTO, because `rust-lld` then fails the final
+link on hundreds of undefined `aws_lc_*` symbols. Any packaging of this project turns
+distribution-wide LTO off; `PKGBUILD` does it with `options=(!lto)`.
+
+## Storage
+
+- **History** — SQLite, keyed `(provider, account, window, segment)`. A point is written
+  only when `used_percent` changes, plus an hourly anchor. Points older than 90 days are
+  thinned to one per 15 minutes, except that the first and last point of every segment
+  always survive — without them a thinned segment loses the two things worth keeping, where
+  it started and how full it got. The default retention is `forever`, so nothing is deleted
+  outright unless the user chooses six months or one year in Preferences. A shorter policy
+  deletes older points immediately and during daily maintenance. Clear History deletes
+  points, segments, notification deduplication and last-observed state, then compacts the
+  database; provider configuration and credentials are separate and survive.
+- **Last seen is not last written** — the reading segmentation compares against is the last
+  one *observed*, which is not the last one *stored*. A window can roll over without
+  consumption moving, and that transition is visible only in a reading no point was written
+  for. Every poll updates the last-seen state whether or not it produces a row.
+- **Segment boundaries** — a new segment starts when consumption falls, or when
+  `resets_at` moves **further forward than the elapsed time explains**. Either signal is
+  sufficient and neither is required: a provider may omit `resets_at` entirely, and a
+  window can roll over from zero to zero without consumption moving at all.
+
+  The comparison is against elapsed time, not against a fixed tolerance, and the
+  difference is not academic. Two distinct pathologies live in the nine months of prior-art
+  history on this machine, and only one of them is jitter:
+
+  * *Jitter.* `claude.json` reports the same window as `807785940` and `807786000` a minute
+    apart. A ±5 minute tolerance absorbs this.
+  * *Drift.* Some windows are reported as "now plus what is left", so `resets_at` advances
+    by the whole poll interval — five minutes — on every single poll. No two values are
+    ever equal, and no fixed tolerance ever merges them, because the movement is exactly
+    the size of the tolerance and never stops.
+
+  Measured over that corpus, exact equality gives `opencodego primary` 1363 segments from
+  1363 readings and `antigravity secondary` 825 from 831. The elapsed-time rule gives 13
+  and 1. The tolerance still exists, at five minutes, but it absorbs jitter *on top of* the
+  elapsed time rather than standing in for it.
+- **Rejected on ingest** — points with a zero or absurd timestamp. They sort wrong and
+  stretch every chart by decades.
+- **Window identity** — a window's key is derived from its **length**, never from the field
+  name the provider used. Codex proves why: on 2026-08-19 its only window arrived as
+  `rate_limit.primary_window` carrying `limit_window_seconds: 604800` — a *weekly* window in
+  the slot named "primary", with `secondary_window: null`. Earlier the same account had its
+  weekly figures recorded under `secondary`. Keying on the provider's positional name would
+  split one continuous window into two and emit spurious appeared/disappeared events.
+- **Secrets** — our own API keys go to the Secret Service (`org.freedesktop.secrets`).
+  The daemon must handle "keyring still locked" as an explicit state rather than a crash;
+  the unit orders itself after `graphical-session.target`.
+- **Third-party credential files** stay where they are, and are never *created* by us. See
+  ADR 0001. Highwater updates the token fields of a file its vendor CLI already owns; it
+  does not write one into existence, so a sign-in performed here can never overwrite or
+  invent somebody else's session.
+- **A login performed from Highwater** is stored under the token schema above, in the same
+  document shape the vendor CLI uses — so one parser and one expiry rule serve both
+  sources. It wins over the CLI's file when it is there, because it exists only because
+  the user explicitly signed in here; signing out removes it and hands the account back.
+- **Settings** — `config.toml` holds what is neither a secret nor a reading: Z.ai's region,
+  the ordered `providers` array and the per-window notification opt-in (`[notify.<slug>]`,
+  a `windows` array of window keys). **That `providers` array is the card order.** Not a
+  second key beside it: it is already ordered, already the user's set, already the order
+  `GetStatus` publishes in, and adding a provider already appends to it — which is exactly
+  what "a new card goes on the end" means. A separate `card_order` would be a second list to
+  keep in agreement with the first, and its first question — where a provider named in one
+  and absent from the other goes — has no good answer. Reordering **moves the values and
+  leaves the decoration where it was written**: a TOML array has no notion of a comment
+  belonging to an element, since in `"claude", # mine` the comment is part of the *next*
+  element's prefix and in the style above it part of its own, so carrying decoration along
+  would scramble comments and indentation in opposite directions depending on which style
+  the file uses. What comes back is the file byte for byte apart from the slugs. A missing
+  file or missing
+  array has the same meaning as `providers = []`: a fresh installation has no configured
+  accounts. It is edited rather than rewritten, so comments, ordering and keys a newer
+  build added all survive a change made from the interface. A file that does not parse is
+  an error, never silently replaced with defaults. Removing a provider deletes its
+  provider-specific settings and both kinds of Highwater-owned credential, then removes its
+  account and card; quota history and vendor-owned credential files or `agy` sessions are
+  retained.
+- **Application preferences use the same file, not GSettings.** `[general]` carries
+  `minimize_on_close` (default `true`) and `startup`, whose named modes are `app` (the
+  default: app and tray), `daemon` (daemon only), and `off`; `[updates] check` defaults to
+  `true`; `[history] retention` is `forever`, `six-months` or `one-year`; `[proxy]` carries
+  `mode`, `host` and `port`, written as one edit because they are one setting. A present value
+  with the wrong type or an unknown named choice is an error, not a reason to guess.
+  Mutations travel over D-Bus and share the engine's serial configuration queue, so a
+  provider edit and a global preference cannot overwrite each other.
+- **The startup mode names one coherent desired state in `config.toml` and applies both
+  platform integrations.** Hiding the desktop client writes the standard per-user XDG
+  autostart override (`Hidden=true`); exposing it removes that override and reveals the
+  packaged `/etc/xdg/autostart` entry again. Daemon-only startup uses `systemctl --user
+  enable highwaterd.service`; the other modes disable that unit without stopping the current
+  daemon, because launching the app already D-Bus-activates it. If either platform
+  integration or persistence fails, the previous platform mode is restored.
+
+## Networking
+
+Every request sets `User-Agent: Highwater/<version>`. This is not cosmetic:
+`platform.claude.com` sits behind Cloudflare and answers an unset agent with
+`403 browser_signature_banned`. Identify honestly by product name. We authenticate with
+real credentials to documented endpoints; outside the one exception below there is no
+reason to look like anything other than what we are.
+
+**The one exception: T3 Chat.** Vercel fronts `t3.chat` with a challenge that gates on
+the client's TLS and HTTP/2 fingerprints rather than on cookies or headers — the honest
+client is challenged no matter what it says, and a real browser is let through with no
+session at all. That provider alone rides `wreq` (BoringSSL), emulating the Chrome or
+Firefox fingerprint of the chosen session's browser family while carrying that session's
+own cookies. The impersonation is transport-level only. The prohibition that actually
+matters — and holds without exception — is on embedding web: no webview, no JS engine,
+no bundled browser ever runs inside this process.
+
+**One proxy, set once, applied everywhere.** `[proxy]` in `config.toml` names a mode
+(`off`, `http`, `https`, `socks5`), a host and a port; `highwater-core`'s `providers::http`
+holds it for the process, and every client this program builds starts from that one
+builder. `socks5` becomes a `socks5h://` URL, so names are resolved at the proxy — for
+anyone whose own resolver is the thing in the way, resolving here and handing the proxy an
+address would defeat the point.
+
+- **A subprocess is not an exception.** Antigravity's `agy` does its own HTTP, so the proxy
+  is handed to it as `HTTP(S)_PROXY`/`ALL_PROXY`/`NO_PROXY` in both spellings, at spawn
+  time, per command. **Not** on the systemd unit: an environment variable there takes
+  effect on a restart, and a restart takes every card off the screen until the first poll
+  comes back.
+- **A change is adopted without restarting anything.** `SetProxy` takes all three values as
+  one call — half a proxy applied is a proxy nothing can be reached through — validates the
+  URL before the file is written, then drops every provider client. A `reqwest::Client`
+  holds its proxy for life and its pool holds sockets opened through the old one, so the
+  clients are rebuilt from stored keys and settings on the next poll. **No status is
+  touched**: each card keeps its last good reading while the new client is built under it.
+  Dropping Antigravity's client shuts `agy` down, and the next poll spawns it again with
+  the new environment.
+- **Loopback is never proxied.** `localhost,127.0.0.0/8,::1` is excluded on our clients and
+  passed as `NO_PROXY` to children, and Antigravity's loopback client is built with
+  `no_proxy()` outright. Asking a proxy to reach `agy` on this machine asks it to connect
+  to itself.
+- **Off means "as before", not "direct".** With no mode set, `reqwest` reads the process
+  environment and a child inherits it, which is what this program did before the setting
+  existed.
+
+## Polling
+
+Adaptive, in two modes kept in `[refresh]` in `config.toml` and switched from the
+preferences dialog.
+
+**Auto** (the default) paces each account by its worst window: ten minutes under 70% used,
+five minutes from 70%, one minute from 90%, and ten again once the quota is exhausted —
+nothing more can be spent, and the reset itself is watched for separately. The zone
+boundaries are the same 70/90 constants the bar colours and the notifications use, so all
+three agree about when a window is worth watching. Within fifteen minutes of a reset —
+including an overdue one — the interval drops to sixty seconds, because a rollover is the
+one event history cannot reconstruct afterwards, and the reset notification is owed the
+moment the boundary passes rather than one zone-interval later.
+
+**Manual** polls healthy accounts at exactly the chosen interval, one to a hundred and
+twenty minutes. No near-reset acceleration: the user picked a pace and gets it, at the
+stated cost that a reset notification can arrive one interval late.
+
+Changing the mode polls every account immediately; changing the manual interval applies
+from each account's next poll. There is deliberately no idle slowdown in either mode:
+half an hour of quiet is enough to spend most of a cheap subscription's quota with no
+notification at all.
+
+Failures back off exponentially in both modes — five minutes, doubling, capped at an hour.
+A provider's own `Retry-After` is obeyed when it is *longer* than our backoff and never
+when it is shorter: a service failing every request while asking for one second would
+otherwise turn a backoff into a hot loop. The hour cap applies to our own guess, not to an
+explicit instruction from the provider. A locked keyring is re-asked every minute; states
+only the user can clear wait half an hour.
+Antigravity likely needs a longer interval of its own because reaching it means bringing
+up the `agy` local HTTPS server rather than making one request — to be measured.
+
+Gaps from suspend stay gaps. History records observed measurements; invented points would
+corrupt the forecast, which is the one thing the history exists for.
+
+## Notifications
+
+Thresholds at 70% and 90%, fired once per segment — the segment is the natural dedup key,
+and the rows recording what has gone out live in the history database, so a daemon restart
+does not warn anybody a second time. Any window can notify, not just the dominant one: you
+need to know both that the five-hour window is closing and that the weekly one is.
+
+**Opted into per window.** Five providers report fifteen windows between them, and a
+warning about all of them is a warning about none, so a freshly added provider is silent
+until a switch on its settings page is turned on. The switch covers both the thresholds and
+the reset for that window.
+
+**A reset always notifies**, however little of the previous segment was spent. The earlier
+rule here was "only above 50%, because *your weekly quota reset* after burning 3% of it is
+noise" — and that reasoning holds only for resets that arrive on schedule. Providers reset
+quota outside their own schedule, and an unscheduled reset is exactly the news a person
+acts on. The opt-in is what keeps the volume down; a consumption threshold on top of it
+would only hide the interesting case.
+
+The two thresholds are the same constants the bar changes colour at, defined once in
+`highwater-types` rather than in each process, and the phrasing of a percentage or a span is
+shared the same way: the card and the notification must never disagree.
+
+Forecast-based notifications are deliberately not in v1 — they need calibration against
+history that does not exist yet.
+
+## Interface
+
+The Slint markup in `crates/highwater/ui/` draws published state; Rust controllers own
+IPC, dialog lifetimes and pure presentation decisions.
+
+- **Grid of provider cards**, columns by width, **in the order the user put them in**.
+  How many columns the width turns into is a preference: Auto (the default) fits as many
+  columns as the window holds, and Manual caps the count at a chosen ceiling. Nothing else
+  ever changes that order: there is no urgency sort underneath it, a new account goes on
+  the end, and the sequence is persisted by the daemon and republished to every client.
+  The grid the tray menu lists and the grid the settings dialog lists are this one.
+- **The grid animates reordering in Slint.** A held card follows the pointer while
+  displaced cards move into their prospective slots. Each slot retains its current
+  position so a changed target can animate from where the card already is. The grid
+  uses pointer events, a drag threshold and a separate carrying layer in `ui/app.slint`.
+- **The order is committed on release, not on the way.** A file write and a D-Bus round trip
+  per pixel is not a design. The drop is applied locally first and sent afterwards, because
+  a grid that waited for the daemon before showing where the card landed would feel broken;
+  a refusal — the configured set moved while the card was in the air — puts the cards back
+  to what the daemon actually has.
+- **Empty state** — when there are no configured providers, the main window says
+  `Welcome to Highwater` and `Add a provider to start tracking your quota.` The providers
+  button remains available while the daemon is connected.
+- **Card** — logo, name, plan, state chip; the dominant window as a large number
+  over a bar with a pace mark; remaining windows as thin rows; and one quiet line along the
+  bottom saying when the reading was taken. The dominant window is the shortest present
+  one, unless the provider names a lead window of its own — NanoGPT does, because its
+  weekly input pool is the subscription and the hundred-images-a-day allowance beside it
+  would otherwise be the headline at zero, every day. The plan is a convention rather than
+  a field: the first row of the detail section a provider titles `Plan`.
+- **The mark, the name and the plan stand on one baseline.** Each mark is framed on
+  the floor of its square, with text aligned beside it in `ui/card.slint`.
+- **When the next poll is due is not on the card.** It is the daemon's schedule rather than
+  news about the account, and on a window that updates itself it was one more number moving
+  for no reason the reader has to act on.
+- **The logo is the provider's own mark, monochrome**, drawn as a symbolic icon and
+  recoloured by the theme — not a glyph of our invention standing in for someone else's
+  product. The marks are their owners' trademarks, used to identify the service the card is
+  about; they are not covered by this project's licence, and whatever ships them says so.
+- **Provider settings carry the notification switches** — one row per window the account
+  currently reports, drawn from the last reading rather than from a fixed list, because the
+  window set is whatever arrived. An account nobody has polled yet has no switches to
+  offer and the group is not drawn at all.
+- **The bar and pace mark are drawn in Slint.** Their colours come from `Theme`, whose
+  accent follows the desktop portal on Linux and the registry on Windows. Warning and
+  error colours change at **70% and 90%**, the shared notification thresholds.
+- **A card raises on hover** by two pixels with a soft shadow. The slot retains the
+  pointer area while the card moves, so the lift cannot make hover flicker.
+- **A card being carried is opaque.** It takes the popover surface colour and a deeper
+  shadow, while its foreground stays unchanged.
+- **Cards are fixed at 300 × 234 logical pixels**, including before the first reading
+  and while every provider reports an error. Rows share a height and their footers line
+  up; the last row stays left aligned within the centred grid. Long card content scrolls
+  with the mouse wheel; cards never show scrollbars. Labels ellipsize or wrap within the
+  allocation, so neither a URL in an error nor a provider title can change the grid
+  geometry. The full error is available in provider settings and through the failed-check
+  footer.
+- **The footer reports check progress.** A spinner replaces the last-check time while
+  the daemon publishes `checking`. A failed check shows red `check failed`; clicking it
+  opens an alert with the daemon's diagnostic. The last good metrics remain visible.
+- **A window the provider did not send is not drawn.** No placeholder, no explanation. The
+  window set is whatever arrived; the card rearranges silently when it changes. Needs
+  hysteresis in the daemon so a single malformed response does not make a window blink.
+- **Click opens a detail dialog** inside the Slint window with standard dimming, quota
+  window selection, the burn-down chart for the current segment, and published detail
+  sections. Live updates keep a still-reported selection; D-Bus request generations discard
+  stale history replies. Even pace is drawn only with a reported reset and window length.
+- **Failure states** are distinguished in data but collapsed in the UI into three groups by
+  what the user must do: *you fix it* / *it fixes itself* / *they broke it*. The first group
+  has somewhere to go: the provider's settings detail page.
+- **Provider settings** opens on a list of configured accounts. Its add button pushes a
+  searchable picker containing catalog entries that have not been configured; choosing
+  one adds it and opens that provider's detail page. Edit reaches the same detail page,
+  which is drawn from the daemon's authentication and settings declarations. A stored key
+  is never shown back: the row says whether there is one, and replacement requires typing
+  a new one. Removal is destructive and confirmed: it deletes Highwater-owned credentials,
+  provider settings and the current card, but keeps quota history. Closing the preferences
+  dialog cancels pending OAuth work, and the dialog can then be opened again.
+- **A provider with two credentials names both of them.** Its authentication group leads
+  with a two-part control — Highwater's own login, and the login the vendor's program keeps
+  on this machine — and the rows below it are the half that is selected. The Highwater half
+  is the sign-in button and what it is signed in as. The local half is the three things
+  somebody with a problem needs, in that order: whether the login is there and where
+  Highwater looked for it, what to run if it is not, and — where it is true — that Highwater
+  refreshes that credential in place and writes the rotated token back into a file it does
+  not own. That last sentence is ADR 0001, and it is stated in the open next to the choice
+  rather than left to be discovered: a program that edits another program's credentials
+  says so where the decision is made.
+- **The primary menu and dialogs are Slint components.** The header menu opens
+  Preferences and About; provider management has its own header button. Preferences
+  has General, Network and Data pages. The release-check switch lives on Network beside
+  the proxy, because it controls application network access. About shows the icon, name,
+  version, developer, website, report link and MIT legal notice. The report link goes to
+  `/issues/new/choose` so repository templates collect the version and desktop.
+- **Cards and provider-list rows share an account menu.** Icon-labelled actions add an
+  account, edit it, refresh it or remove it. Provider-list rows expose the same menu
+  through one button rather than separate action buttons.
+- **The three proxy rows are one form, and the mode row opens the other two.** Choosing
+  `SOCKS5` before typing where the proxy is, is how the group gets filled in, so the
+  choice alone is not sent - the daemon would refuse half a proxy and be right to - and the
+  host and the port become editable off the *row's* selection rather than off what is
+  stored. Deriving them from storage is a lock: the stored mode is still `off` at exactly
+  the moment the two rows that would change it have to be typed into. Nothing reaches the
+  daemon until all three are complete, and only a deliberate submit of an incomplete one is
+  marked wrong.
+- **The one page that is ours is Troubleshooting**, and it is there so those questions are
+  answered before they are asked: the client's version, the version the daemon on the other
+  end reported, the toolkit version and renderer actually drawing, the desktop and session
+  type, and whether a status-notifier host took the icon — which is the difference between
+  a close button that hides the window and one that ends the program. Runtime values, not
+  the compiled floor: the floor is what we built against and no evidence at all about the
+  machine the bug is on.
+- **Tray** — a static StatusNotifierItem, owned by the interface process rather than by the
+  daemon. Left click shows the window; the menu lists the configured accounts with the
+  percentage of their dominant window, in the order the grid uses, and ends with Open,
+  Refresh and Quit. The icon takes the `NeedsAttention` status at the same threshold the
+  bar changes colour at and the notification fires at, so the panel cannot become a third
+  opinion about when a window got worrying.
+- **Closing the window hides it by default; the tray is what the program minimises to.**
+  `minimize_on_close = true` keeps the interface process alive, readings keep arriving, and
+  Quit in the tray menu is the way out. Switching it off makes close end the interface
+  process. Both choices remain conditional on the icon actually being accepted: when no
+  status-notifier host answers, close always ends the process because hiding a window with
+  nothing left to bring it back is worse than ignoring a preference.
+- **The `app` startup mode uses that same tray condition.** `highwater --background` builds
+  the window without showing it and stays only after a StatusNotifier host accepts the
+  icon. On Linux it waits up to 30 seconds for the watcher to appear during session
+  startup, using D-Bus name-owner signals. On a desktop without one it exits cleanly
+  instead of leaving an invisible process behind.
+- **Release checks are optional twice.** `[updates] check = false` stops the hourly GitHub
+  request at runtime and clears any published update notice. The daemon's `update-check`
+  Cargo feature is enabled by default for upstream builds; a distribution can build with
+  `--no-default-features`, in which case Preferences shows the switch off and unavailable.
+- **An update offer is a preview, not an updater.** The header button opens the release
+  notes in a dialog — Markdown parsed into Slint text blocks, bare URLs linked, raw HTML
+  dropped — and its two buttons are Cancel and Download on GitHub. Highwater is installed by
+  a package manager, an installer or a distribution, so the dialog ends at the release page
+  rather than pretending this process can replace itself. A release published without notes
+  opens that page directly: a dialog whose only content is "no notes" is a click that told
+  the reader nothing.
+- **Tray backends are platform-specific.** Linux speaks StatusNotifierItem and
+  `com.canonical.dbusmenu` through `ksni` (Unlicense), on the same zbus async-io backend
+  as the daemon connection. Windows uses `tray-icon` with unused Linux features disabled.
+- **The window owns its frame.** Rounded transparent corners, header controls and native
+  dragging are drawn through Slint and winit. Windows presents through DirectComposition:
+  a swap chain on the window itself, and Vulkan, are opaque there and fill the corners
+  with the driver's colour. Windows supplies its native shadow; Wayland
+  uses a click-through subsurface outside the window geometry. Maximized and full-screen
+  windows have square corners and no custom shadow. Showing a hidden window requests a
+  new frame so a background Wayland launch maps when opened from the tray.
+
+## Packaging
+
+`deb`, `rpm`, `PKGBUILD`. Distribution artwork policies can refuse third-party trademarks,
+so a build with no provider marks stays a supported configuration: a card without one is a
+state the interface already has.
+
+The repository-local flake exports the Nix package and `nixosModules.default`. Enabling the
+module registers only the D-Bus-activated user daemon; it does not autostart the desktop client.
+The scheduled workflow proposes `flake.lock` updates through a reviewed pull request. DEB,
+RPM, and the local `PKGBUILD` retain their distinct installation and upgrade behavior.
+
+The `rpm` targets Fedora 44+ and the `deb` Ubuntu 26.04+. Those are the current
+release build targets; lowering their floors is a separate packaging decision.
+
+glibc is forward- but not backward-compatible, so a build host must be no newer than the
+oldest target. That is settled by construction rather than by choosing a host: each format
+is built on the oldest release of its own target — the `deb` on the `ubuntu-26.04` runner,
+the `rpm` in a `fedora:44` container, because GitHub hosts no Fedora runner. There is no
+cross-distribution glibc question left to get wrong.
+
+Building each format on its own target is a correctness requirement, not tidiness.
+Measured 2026-08-22: `cargo-generate-rpm`'s `auto-req` scans the payload *transitively*
+rather than reading `DT_NEEDED`, so an `rpm` built on Arch asked for `libgstreamer`,
+`libcups`, `libkrb5` and `libxml2.so.16` — none of which either binary links, and some of
+which Fedora numbers differently. And neither packaging tool treats a missing dependency
+helper as an error: without `dpkg-shlibdeps`, `depends = "$auto"` resolves to *nothing* and
+`cargo-deb` emits a warning a log scrolls past, yielding a package that installs without the
+libraries it links and then fails to start. `scripts/check-package-deps.sh` turns that warning
+into a failed build, and both package jobs run it.
+
+An upgrade restarts the user's daemon: both formats' maintainer scripts call
+`data/restart-user-daemon`, which uses `runuser` plus the user's runtime directory to reach
+each real user manager rather than talking to root's. Fedora's `.host` machine transport
+cannot reach the user manager in the systemd container even with `systemd-machined`
+running, so it is deliberately not part of this path. `scripts/test-package-upgrade.sh`
+proves the restart against real systemd user managers and real `dpkg` / `rpm`
+transactions; it is run by hand rather than in CI.
+
+## Non-goals
+
+- No web UI, no Electron, no embedded browser engine. See ADR 0002 and ADR 0003.
+- No silent source selection. A local browser or app session is read only from
+  the source the user picked and the daemon validated; nothing scans or falls
+  back on its own.
+- No API Platform spend dashboards. Different metric, different product.
+- No forecast-driven notifications until there is history to calibrate them on.
+
+## Prior art
+
+CodexBar (MIT, Swift, macOS menu bar) is read for protocol facts: which endpoint, which
+field, which fallback order. Its layout is macOS popup-shaped and is not a reference for
+ours. `~/repos/CodexBar` on this machine contains an abandoned Linux-GUI fork; it is a
+dead end and is not a base for this project.

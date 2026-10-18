@@ -1,0 +1,292 @@
+// One account's quota windows, current-segment history, and published detail sections.
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { ActionRow, BoxedList, Button, Caption, GroupHeading, Spinner, Scrim } from "widgets.slint";
+
+export struct QuotaWindowData { title: string, summary: string }
+export struct QuotaDetailRow { label: string, value: string }
+export struct QuotaSectionData { title: string, rows: [QuotaDetailRow] }
+
+export global QuotaDetails {
+    in property <bool> open;
+    in property <string> name;
+    in property <string> account;
+    in property <string> state;
+    in property <image> mark;
+    in property <bool> has-mark;
+    in property <[QuotaWindowData]> windows;
+    in property <int> selected: -1;
+    in property <[QuotaSectionData]> sections;
+    in property <string> schedule;
+    in property <bool> has-schedule;
+    in property <string> message;
+    in property <bool> loading;
+    in property <bool> failed;
+    // Coordinates in a 1000 by 1000 view box, scaled to the plot's dimensions.
+    in property <string> actual;
+    // The same line closed down to the baseline, filled under it.
+    in property <string> area;
+    // When the two ends of the x axis are, relative to now.
+    in property <string> start-label;
+    in property <string> end-label;
+    in property <bool> has-marker;
+    in property <float> marker-x;
+    in property <float> marker-y;
+    callback close();
+    callback select(int);
+}
+
+export component QuotaDetailsDialog inherits Scrim {
+
+    scope := FocusScope {
+        init => { self.focus(); }
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                QuotaDetails.close();
+                return accept;
+            }
+            reject
+        }
+
+        Rectangle {
+            x: (root.width - self.width) / 2;
+            y: (root.height - self.height) / 2 + root.rise;
+            width: min(720px, root.width - 24px);
+            height: min(680px, root.height - 24px);
+            background: Theme.window-bg;
+            border-radius: 14px;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 4px;
+            drop-shadow-color: #00000050;
+
+            VerticalLayout {
+                // The account itself heads the dialog, centred like the provider dialog's
+                // account page, and stays put while the sections below scroll.
+                VerticalLayout {
+                    padding-top: 18px;
+                    padding-bottom: 6px;
+                    padding-left: 60px;
+                    padding-right: 60px;
+                    spacing: 6px;
+                    if QuotaDetails.has-mark: HorizontalLayout {
+                        alignment: center;
+                        Image {
+                            source: QuotaDetails.mark;
+                            colorize: Theme.fg;
+                            width: 72px;
+                            height: 72px;
+                        }
+                    }
+                    Text {
+                        text: QuotaDetails.name;
+                        color: Theme.fg;
+                        font-size: Theme.body * 1.36;
+                        font-weight: 800;
+                        horizontal-alignment: center;
+                        overflow: elide;
+                    }
+                    if QuotaDetails.account != "": Caption {
+                        text: QuotaDetails.account;
+                        horizontal-alignment: center;
+                    }
+                    if QuotaDetails.state != "": Caption {
+                        text: QuotaDetails.state;
+                        horizontal-alignment: center;
+                    }
+                }
+
+                ScrollView {
+                    vertical-stretch: 1;
+                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+                    mouse-drag-pan-enabled: false;
+                    content-width: self.visible-width;
+                    // Sections keep their own height: a short page leaves the space below empty
+                    // rather than stretching its rows to fill the dialog.
+                    VerticalLayout {
+                        alignment: start;
+                        padding: 24px;
+                        padding-top: 12px;
+                        spacing: 18px;
+
+                        if QuotaDetails.windows.length > 0: VerticalLayout {
+                            GroupHeading { title: "Quota windows"; }
+                            BoxedList {
+                                for window[index] in QuotaDetails.windows: ActionRow {
+                                    title: window.title;
+                                    subtitle: window.summary;
+                                    first: index == 0;
+                                    last: index == QuotaDetails.windows.length - 1;
+                                    activatable: true;
+                                    activated => { QuotaDetails.select(index); }
+                                    if index == QuotaDetails.selected: Image {
+                                        source: @image-url("icons/object-select-symbolic.svg");
+                                        colorize: Theme.link;
+                                        width: 16px;
+                                        height: 16px;
+                                    }
+                                }
+                            }
+                        }
+
+                        // A balance-only account has no window to chart, so no chart and no
+                        // placeholder for one.
+                        if QuotaDetails.windows.length > 0: VerticalLayout {
+                            spacing: 6px;
+                            GroupHeading { title: "Burn-down"; description: QuotaDetails.schedule; }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Rectangle { width: 14px; height: 2.5px; background: Theme.accent; }
+                                }
+                                Caption { text: "Actual"; }
+                                if QuotaDetails.has-schedule: HorizontalLayout {
+                                    spacing: 6px;
+                                    padding-left: 10px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        HorizontalLayout {
+                                            spacing: 2px;
+                                            for dash in 3: Rectangle { width: 3px; height: 1.5px; background: Theme.ink(0.38); }
+                                        }
+                                    }
+                                    Caption { text: "Even pace"; }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                            Rectangle {
+                                height: 220px;
+                                // Leave space for the stroke and a single observation's dot.
+                                plot := Rectangle {
+                                    x: 4px;
+                                    y: 4px;
+                                    width: parent.width - 8px;
+                                    height: parent.height - 8px;
+
+                                    // Full and half use, the scale every reading is read against.
+                                    for level in [0, 0.5, 1]: Rectangle {
+                                        y: (1 - level) * plot.height;
+                                        height: 1px;
+                                        background: Theme.ink(level == 0 ? 0.15 : 0.07);
+                                    }
+                                    for level in [0.5, 1]: Text {
+                                        x: 2px;
+                                        y: (1 - level) * plot.height + 3px;
+                                        text: level == 1 ? "100%" : "50%";
+                                        color: Theme.ink(0.4);
+                                        font-size: Theme.caption;
+                                    }
+
+                                    // Drawn in from the left each time a segment loads: the square
+                                    // clip widens while everything in it keeps the plot's size.
+                                    if QuotaDetails.message == "": Rectangle {
+                                        property <float> reveal: 0;
+                                        animate reveal { duration: 600ms; easing: ease-in-out; }
+                                        init => {
+                                            self.reveal = 1;
+                                        }
+                                        x: 0;
+                                        width: plot.width * self.reveal;
+                                        clip: true;
+
+                                        if QuotaDetails.has-schedule: Rectangle {
+                                            x: 0;
+                                            width: plot.width;
+                                            height: plot.height;
+                                            for dash in 20: Path {
+                                                width: plot.width;
+                                                height: plot.height;
+                                                viewbox-width: 1;
+                                                viewbox-height: 1;
+                                                fit: fill;
+                                                stroke: Theme.ink(0.38);
+                                                stroke-width: 1.5px;
+                                                MoveTo { x: dash / 20; y: 1 - dash / 20; }
+                                                LineTo { x: (dash + 0.5) / 20; y: 1 - (dash + 0.5) / 20; }
+                                            }
+                                        }
+                                        if QuotaDetails.area != "": Path {
+                                            x: 0;
+                                            width: plot.width;
+                                            height: plot.height;
+                                            viewbox-width: 1000;
+                                            viewbox-height: 1000;
+                                            fit: fill;
+                                            commands: QuotaDetails.area;
+                                            fill: @linear-gradient(180deg, Theme.accent.with-alpha(0.3) 0%, Theme.accent.with-alpha(0.02) 100%);
+                                        }
+                                        Path {
+                                            x: 0;
+                                            width: plot.width;
+                                            height: plot.height;
+                                            viewbox-width: 1000;
+                                            viewbox-height: 1000;
+                                            fit: fill;
+                                            commands: QuotaDetails.actual;
+                                            stroke: Theme.accent;
+                                            stroke-width: 2.5px;
+                                        }
+                                        if QuotaDetails.has-marker: Rectangle {
+                                            x: QuotaDetails.marker-x / 1000 * plot.width - 4px;
+                                            y: QuotaDetails.marker-y / 1000 * plot.height - 4px;
+                                            width: 8px;
+                                            height: 8px;
+                                            border-radius: 4px;
+                                            background: Theme.accent;
+                                        }
+                                    }
+                                    if QuotaDetails.message != "": VerticalLayout {
+                                        alignment: center;
+                                        spacing: 10px;
+                                        if QuotaDetails.loading: HorizontalLayout {
+                                            alignment: center;
+                                            Spinner { size: 24px; }
+                                        }
+                                        Text {
+                                            text: QuotaDetails.message;
+                                            color: QuotaDetails.failed ? Theme.error : Theme.ink(Theme.dim);
+                                            horizontal-alignment: center;
+                                            wrap: char-wrap;
+                                        }
+                                    }
+                                }
+                            }
+                            if QuotaDetails.message == "": HorizontalLayout {
+                                Caption { text: QuotaDetails.start-label; }
+                                Caption {
+                                    text: QuotaDetails.end-label;
+                                    horizontal-alignment: right;
+                                }
+                            }
+                        }
+
+                        for section in QuotaDetails.sections: VerticalLayout {
+                            GroupHeading { title: section.title; }
+                            BoxedList {
+                                for row[index] in section.rows: ActionRow {
+                                    title: row.label;
+                                    subtitle: row.value;
+                                    first: index == 0;
+                                    last: index == section.rows.length - 1;
+                                    wrap-anywhere: true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Over the hero's corner rather than in a header row of its own.
+            // Sized here: outside a layout an element fills its parent.
+            Button {
+                width: self.button-height;
+                x: parent.width - self.width - 6px;
+                y: 6px;
+                kind: 3;
+                has-icon: true;
+                icon: @image-url("icons/window-close-symbolic.svg");
+                clicked => { QuotaDetails.close(); }
+            }
+        }
+    }
+}

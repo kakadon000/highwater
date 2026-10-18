@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Highwater — Your AI quota, at a glance</title>
+<meta name="description" content="Highwater is a native desktop widget for Linux and Windows that tracks every rate-limit window your AI providers report. Rust + Slint. No Electron." />
+<link rel="icon" type="image/png" href="assets/icon.png" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a class="brand" href="#">
+      <img src="assets/icon.png" alt="" class="brand-icon" />
+      <span>Highwater</span>
+    </a>
+    <div class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#providers">Providers</a>
+      <a href="#cli">CLI</a>
+      <a href="#download">Download</a>
+    </div>
+    <a class="btn btn-ghost btn-sm" href="https://github.com/kakadon000/highwater" target="_blank" rel="noopener">GitHub</a>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="hero-text">
+    <span class="chip">v0.7.0 · Windows &amp; Linux · MIT</span>
+    <h1>Your AI quota,<br /><span class="accent">at a glance.</span></h1>
+    <p class="lead">
+      Highwater sits on your desktop and tracks every rate-limit window your AI
+      providers report — how much you burned, when it resets, and whether your
+      current pace gets you there.
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="https://github.com/kakadon000/highwater/releases/latest" target="_blank" rel="noopener">Download for Windows</a>
+      <a class="btn btn-ghost" href="https://github.com/kakadon000/highwater/releases" target="_blank" rel="noopener">.deb / .rpm</a>
+    </div>
+    <p class="micro">Native Rust + Slint · No Electron · No telemetry · Lives in your tray</p>
+  </div>
+
+  <div class="mock" aria-hidden="true">
+    <div class="mock-titlebar">
+      <span class="mock-dot"></span><span class="mock-dot"></span><span class="mock-dot"></span>
+      <span class="mock-title">Highwater</span>
+    </div>
+    <div class="mock-card">
+      <div class="row-head">
+        <span class="p-dot p-claude"></span>
+        <span class="p-name">Claude</span>
+        <span class="p-acct">Pro</span>
+        <span class="p-pct warn-c">82%</span>
+      </div>
+      <div class="bar"><div class="fill warn-c warn-f" style="width:82%"></div><span class="mark" style="left:64%"></span></div>
+      <div class="row-foot"><span>5-hour window</span><span>resets in 2h 14m</span></div>
+    </div>
+    <div class="mock-card">
+      <div class="row-head">
+        <span class="p-dot p-codex"></span>
+        <span class="p-name">Codex</span>
+        <span class="p-acct">Plus</span>
+        <span class="p-pct ok-c">34%</span>
+      </div>
+      <div class="bar"><div class="fill ok-c ok-f" style="width:34%"></div><span class="mark" style="left:58%"></span></div>
+      <div class="row-foot"><span>Weekly window</span><span>resets in 3d 6h</span></div>
+    </div>
+    <div class="mock-card">
+      <div class="row-head">
+        <span class="p-dot p-zai"></span>
+        <span class="p-name">Z.ai</span>
+        <span class="p-acct">GLM Coding</span>
+        <span class="p-pct danger-c">91%</span>
+      </div>
+      <div class="bar"><div class="fill danger-c danger-f" style="width:91%"></div><span class="mark" style="left:70%"></span></div>
+      <div class="row-foot"><span>Monthly window</span><span>resets in 12h 03m</span></div>
+    </div>
+  </div>
+</header>
+
+<section id="features" class="section">
+  <h2>Everything the window hides from you</h2>
+  <p class="section-sub">One card per account, side by side. The daemon keeps polling when the window is closed.</p>
+  <div class="grid">
+    <div class="card"><h3>Every window</h3><p>Five-hour, weekly, monthly — whatever the provider exposes, each with its own reset time and its own card.</p></div>
+    <div class="card"><h3>Several accounts</h3><p>A work and a personal Claude, two Z.ai keys — grouped behind an expand toggle, named whatever you call them.</p></div>
+    <div class="card"><h3>A pace mark on every bar</h3><p>Fill to the left of the mark means the quota likely lasts until reset. Fill to the right means it does not.</p></div>
+    <div class="card"><h3>Warnings at 70% and 90%</h3><p>Plus a notification when a window resets. Off by default, switched on per window, so you only hear about the ones you care about.</p></div>
+    <div class="card"><h3>History and burn-down</h3><p>Click a card to see how the current window was actually spent, drawn from the daemon's local history.</p></div>
+    <div class="card"><h3>Lives in the tray</h3><p>Closing the window hides it; readings keep arriving. Scriptable end to end through the CLI and D-Bus.</p></div>
+  </div>
+</section>
+
+<section id="providers" class="section">
+  <h2>Every provider you already pay for</h2>
+  <p class="section-sub">Sign in with your account, paste an API key, or point it at a local session.</p>
+  <div class="chips">
+    <span class="chip-p">Claude</span><span class="chip-p">Codex</span><span class="chip-p">Z.ai</span>
+    <span class="chip-p">Gemini</span><span class="chip-p">Grok</span><span class="chip-p">OpenAI</span>
+    <span class="chip-p">OpenRouter</span><span class="chip-p">DeepSeek</span><span class="chip-p">Groq</span>
+    <span class="chip-p">Mistral</span><span class="chip-p">Kimi</span><span class="chip-p">Moonshot</span>
+    <span class="chip-p">MiniMax</span><span class="chip-p">xAI</span><span class="chip-p">Perplexity</span>
+    <span class="chip-p">Cursor</span><span class="chip-p">Ollama</span><span class="chip-p">Warp</span>
+    <span class="chip-p">Factory</span><span class="chip-p">Fireworks</span><span class="chip-p">ElevenLabs</span>
+    <span class="chip-p">Deepgram</span><span class="chip-p">Notion</span><span class="chip-p">Manus</span>
+    <span class="chip-p">Poe</span><span class="chip-p">Venice</span><span class="chip-p">Synthetic</span>
+    <span class="chip-p more">+ 30 more &amp; any custom endpoint via a Lua plugin file</span>
+  </div>
+</section>
+
+<section id="cli" class="section">
+  <h2>A CLI for everything the window does</h2>
+  <p class="section-sub">Same daemon, same data, fully scriptable — guard your long runs before you start them.</p>
+  <div class="term">
+    <div class="term-bar"><span class="mock-dot"></span><span class="mock-dot"></span><span class="mock-dot"></span><span class="term-title">highwaterctl</span></div>
+<pre><span class="c-muted">$</span> highwaterctl usage
+<span class="c-muted">$</span> highwaterctl guard --min-remaining 20 --window w604800 <span class="c-accent">&amp;&amp;</span> launch-long-run
+<span class="c-muted">$</span> highwaterctl watch --format waybar
+<span class="c-muted">$</span> printf <span class="c-ok">'%s'</span> <span class="c-ok">"$ZAI_API_KEY"</span> | highwaterctl auth set-key zai</pre>
+  </div>
+</section>
+
+<section id="download" class="section">
+  <h2>Get Highwater</h2>
+  <p class="section-sub">Free, MIT licensed, built in the open.</p>
+  <div class="grid three">
+    <a class="card dl" href="https://github.com/kakadon000/highwater/releases/latest" target="_blank" rel="noopener">
+      <h3>Windows</h3><p>Setup executable, per-user install, no admin rights. SmartScreen: More info → Run anyway.</p><span class="dl-cta">Download →</span>
+    </a>
+    <a class="card dl" href="https://github.com/kakadon000/highwater/releases/latest" target="_blank" rel="noopener">
+      <h3>Linux</h3><p><code>.deb</code> for Ubuntu 26.04+, <code>.rpm</code> for Fedora 44+, AUR for Arch.</p><span class="dl-cta">Download →</span>
+    </a>
+    <a class="card dl" href="https://github.com/kakadon000/highwater#building-from-source" target="_blank" rel="noopener">
+      <h3>From source</h3><p>Rust 1.92+, CMake, Clang, fontconfig and SQLite dev packages.</p><span class="dl-cta">cargo build →</span>
+    </a>
+  </div>
+</section>
+
+<footer class="footer">
+  <img src="assets/icon.png" alt="" class="footer-icon" />
+  <p>Highwater — see where your usage sits, before it caps.</p>
+  <p class="footer-fine">MIT License · Provider names and marks belong to their owners.</p>
+</footer>
+
+</body>
+</html>

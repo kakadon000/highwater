@@ -1,0 +1,77 @@
+[package]
+name = "highwater-core"
+description = "Provider clients, storage and secret handling for Highwater"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# aes + cbc + pbkdf2 + hmac + sha1: decrypting Chromium's os_crypt cookie values (RustCrypto,
+# pure Rust — the workspace's no-OpenSSL rule holds).
+aes = "0.9.2"
+base64 = "0.23.1"
+cbc = { version = "0.2.1", features = ["block-padding"] }
+fs4 = "1.1.0"
+hmac = "0.13.0"
+libc = "0.2.180"
+# mlua with vendored Lua 5.4: the plugin transformation language. Vendored so a user
+# installs no interpreter and every platform runs the same VM; `lua54` for the goto/integer
+# semantics the format documents. What it costs the stripped daemon is measured by the
+# release size gate, not assumed here.
+mlua = { version = "0.12.1", features = ["lua54", "vendored"] }
+pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
+# quick-xml: the plugin SVG sanitizer. A pull parser and a writer, no DOM and no network —
+# an XML library that resolved an external entity or a DTD would defeat the point of
+# sanitizing at all.
+quick-xml = { version = "0.42.0", default-features = false }
+sha1 = { version = "0.11.0", default-features = false }
+# `socks`: without it a `socks5://` proxy URL parses and then refuses every connection
+# made through it. `system-proxy`: what "no proxy configured here" falls back to.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "socks", "json", "gzip", "form", "query"] }
+rustix = { version = "1.1.4", features = ["process", "pty", "rand"] }
+serde = { version = "1.0.229", features = ["derive"] }
+# `float_roundtrip`: the default parser may land 1 ULP off the literal, which would
+# make a recorded body (parsed by Swift's correctly-rounded reader) and the test
+# literal computed from it disagree — Synthetic's golden 98.05884722222223 does.
+serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
+sha2 = { version = "0.11.0", default-features = false }
+thiserror = "2.0.20"
+highwater-types = { version = "0.7.0", path = "../highwater-types" }
+time = { version = "0.3.47", features = ["formatting", "parsing"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "fs", "sync"] }
+toml_edit = { version = "0.25.13", default-features = false, features = ["parse", "display"] }
+tracing = "0.1.44"
+
+# Unix-only for now: oo7 speaks the Secret Service (D-Bus), and wreq depends
+# unconditionally on boring2 (BoringSSL), which does not build on Windows yet —
+# reversible once boring-sys2 builds there.
+[target.'cfg(unix)'.dependencies]
+rusqlite = "0.40.2"
+oo7 = { version = "0.6.0", default-features = false, features = ["native_crypto", "tokio"] }
+# wreq: the browser-emulating HTTP stack T3 Chat's Vercel edge demands — it gates on the
+# client's TLS/HTTP2 fingerprint, and no honest rustls ClientHello passes (see
+# `providers/keyed/t3chat.rs`). Pinned below 0.16, which raises the toolchain above this
+# workspace's MSRV. `socks`/`system-proxy`: mirror the reqwest feature set so the one
+# proxy policy holds on both stacks; the compression features because the Chrome preset
+# announces them in `accept-encoding`.
+wreq = { version = "~0.15.3", default-features = false, features = ["webpki-roots", "socks", "charset", "gzip", "brotli", "zstd", "deflate"] }
+wreq-util = "~0.1.0"
+
+[target.'cfg(windows)'.dependencies]
+# Bundle SQLite only on Windows; Linux packages continue to link system SQLite.
+rusqlite = { version = "0.40.2", features = ["bundled-windows"] }
+aes-gcm = "0.11.1"
+getrandom = "0.4.3"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
+[dev-dependencies]
+# zvariant, for tests only: `plugin_provider.rs` encodes a published `ProviderStatus` the
+# way the daemon does and searches the bytes for the account's key. Asserting on the struct
+# would only re-read the fields we already know about; the wire form is what leaves.
+zvariant = "5.15.0"

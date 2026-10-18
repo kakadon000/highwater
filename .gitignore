@@ -1,0 +1,30 @@
+/target/
+**/*.rs.bk
+*.pdb
+
+# makepkg output, from building the local PKGBUILD in place
+/pkg/
+/src/
+/*.pkg.tar.*
+
+# local scratch
+/scratch/
+/.direnv/
+/.worktrees/
+
+# local planning, not for history
+/PLAN.md
+/plan/
+
+# ai slop
+.serena
+.codegraph
+.omp
+.omo
+.claude
+.codex
+.opencode
+.mcp.json
+
+# Windows packaging output, including the pinned Inno compiler and test fixtures
+/build/

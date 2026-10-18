@@ -1,0 +1,12 @@
+Opening Highwater starts its daemon through D-Bus activation. The desktop session also
+starts Highwater hidden when a StatusNotifier host is available, keeping its tray ready.
+
+It reports "no-credential" until a provider key is in the Secret Service:
+
+    secret-tool store --label='Highwater: zai (default)' \
+        xdg:schema io.github.kakadon000.Highwater.ProviderKey provider zai account default
+
+Everything it knows is readable without the GUI:
+
+    busctl --user call io.github.kakadon000.Highwater.Daemon /io/github/kakadon000/Highwater \
+        io.github.kakadon000.Highwater.Daemon1 GetStatus

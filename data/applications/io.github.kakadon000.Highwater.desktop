@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Highwater
+Comment=Track AI provider quota limits
+Exec=highwater
+Icon=io.github.kakadon000.Highwater
+Terminal=false
+Categories=Utility;
+Keywords=AI;quota;usage;rate limit;
+StartupNotify=true

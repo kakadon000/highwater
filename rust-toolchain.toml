@@ -1,0 +1,5 @@
+# Pinned so that every machine and every agent builds Highwater the same way.
+# The workspace's rust-version, 1.92, is the floor; "stable" tracks forward from there.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]

@@ -1,0 +1,95 @@
+//! Vocabulary shared by every Highwater process.
+//!
+//! This crate is the contract between the daemon and its clients: the GUI today, a CLI
+//! later. It holds the domain vocabulary defined in `CONTEXT.md` — provider, account,
+//! window, segment, snapshot, pace — and the shapes those travel in over D-Bus.
+//!
+//! It deliberately depends on nothing that talks to the network, the disk or the display.
+//! Anything that needs an HTTP client belongs in `highwater-core`; anything that needs a
+//! display belongs in `highwater`. `scripts/check-layering.sh` enforces that.
+
+pub mod present;
+pub mod semantic;
+pub mod snapshot;
+pub mod time;
+pub mod window;
+pub mod wire;
+
+pub use present::{
+    duration, format_field, format_ratio, icon_name, percent, plugin_icon_slug, provider_icon_name,
+};
+pub use semantic::{
+    Emphasis, Field, Format, Metric, MetricWindow, Presentation, PresentedSection, Widget,
+    WidgetKind,
+};
+pub use snapshot::{
+    AccountId, DetailRow, DetailSection, ProviderId, Snapshot, lead_window_key, ordered_windows,
+    provider_label,
+};
+pub use time::{AbsurdTimestamp, Timestamp};
+pub use window::{DANGER_AT, WARNING_AT, Window, WindowKey, WindowLength};
+pub use wire::{
+    AuthCandidate, AuthCandidateState, AuthMode, AuthSelection, AuthSelector, CredentialKind,
+    DataInfo, ErrorResponse, ExternalLogin, HistoryPoint, OptionChoice, PluginEndpoint, PluginInfo,
+    Preferences, ProviderDefinition, ProviderOption, ProviderState, ProviderStatus, Remedy,
+    WindowStatus, account_id_suggestion, valid_account_id,
+};
+
+/// Identity constants. Changing any of these is a breaking change for installed units,
+/// stored secrets and on-disk state, so they live in exactly one place.
+pub mod ids {
+    /// Application ID, and the bus name the GUI owns.
+    pub const APP_ID: &str = "io.github.kakadon000.Highwater";
+    /// Session-local installer gate. Its kernel lifetime follows Setup/Uninstall.
+    pub const INSTALLER_MUTEX: &str = r"Local\io.github.kakadon000.Highwater.Maintenance";
+    /// Native maintenance requests, handled before changing installed files.
+    // Stop-event prefixes: append '.<pid>' so maintenance cannot stop another copy.
+    pub const DAEMON_STOP_EVENT: &str = r"Local\io.github.kakadon000.Highwater.StopDaemon";
+    pub const CLIENT_STOP_EVENT: &str = r"Local\io.github.kakadon000.Highwater.StopClient";
+    pub const DAEMON_READY_EVENT: &str = r"Local\io.github.kakadon000.Highwater.ReadyDaemon";
+    /// Bus name the daemon owns.
+    pub const DAEMON_BUS_NAME: &str = "io.github.kakadon000.Highwater.Daemon";
+    /// Object path both processes agree on.
+    pub const OBJECT_PATH: &str = "/io/github/kakadon000/Highwater";
+    /// Interface the daemon serves at [`OBJECT_PATH`].
+    ///
+    /// Numbered, the way freedesktop interfaces are — `org.freedesktop.systemd1.Manager`
+    /// and friends — because the CLI and the Waybar module this is shaped for will be
+    /// built against whatever exists when they are written. A second interface is how this
+    /// ever changes incompatibly; the name is not.
+    pub const DAEMON_INTERFACE: &str = "io.github.kakadon000.Highwater.Daemon1";
+    /// Secret Service schema for keys Highwater owns.
+    pub const SECRET_SCHEMA: &str = "io.github.kakadon000.Highwater.ProviderKey";
+    /// Secret Service schema for OAuth tokens created by a login through Highwater.
+    pub const TOKEN_SCHEMA: &str = "io.github.kakadon000.Highwater.ProviderToken";
+    /// The authentication mode a browser session the user pasted in is offered under.
+    ///
+    /// Shared rather than spelled twice: the daemon publishes this mode in a provider's
+    /// selector, and the interface has to know which half of the selector is a place to
+    /// paste into rather than a list of sources to choose from.
+    pub const PASTE_AUTH_MODE: &str = "paste";
+
+    /// Secret Service schema for a browser session header the user pasted in, for a
+    /// provider whose only credential is a session cookie a browser holds — the Windows
+    /// fallback for Chromium App-Bound (`v20`) cookies, which no process but the browser
+    /// itself can decrypt. Stored, read and redacted exactly like the other two.
+    pub const SESSION_SCHEMA: &str = "io.github.kakadon000.Highwater.ProviderSession";
+}
+
+/// The value every outbound request identifies itself with.
+///
+/// Not cosmetic: `platform.claude.com` sits behind Cloudflare and answers a request with
+/// no user agent with `403 browser_signature_banned`. See `CONTEXT.md` § Networking.
+pub fn user_agent() -> String {
+    format!("Highwater/{}", env!("CARGO_PKG_VERSION"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn user_agent_names_the_product_and_a_version() {
+        let ua = super::user_agent();
+        assert!(ua.starts_with("Highwater/"), "{ua}");
+        assert!(ua.len() > "Highwater/".len(), "{ua}");
+    }
+}

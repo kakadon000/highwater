@@ -1,0 +1,25 @@
+[package]
+name = "highwater-ipc"
+description = "The D-Bus contract between highwaterd and its clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# NOTE: this crate is the contract's client half. It may open a connection and nothing
+# else: no provider I/O, no database, no display, and no second async runtime — zbus's
+# async-io backend is what both the window and highwaterctl already build on.
+# scripts/check-layering.sh enforces this.
+[dependencies]
+highwater-types = { path = "../highwater-types" }
+# `p2p` because the Windows GUI builds its connection that way, and this crate is what it
+# generates the proxy from.
+zbus = { version = "5.13.2", features = ["p2p"] }
+
+[dev-dependencies]
+async-io = "2.6.0"

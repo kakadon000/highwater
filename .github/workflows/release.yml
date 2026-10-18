@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+# The builds do not wait for the checks: they run side by side, and only the draft at the
+# end waits for everything. A failure anywhere still means no release object at all; what
+# it costs is the build minutes already spent, which is cheaper than a serial release.
+jobs:
+  version:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: The tag must agree with Cargo.toml
+        run: scripts/check-tag-version.sh "${GITHUB_REF_NAME}"
+
+  # The same gate a pull request passes, called rather than copied.
+  checks:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  deb:
+    # Building on Ubuntu 26.04 makes it the oldest supported target. glibc is forward- but
+    # not backward-compatible,
+    # which is the whole reason each format is built on its own target rather than on one
+    # shared build host.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libfontconfig-dev libsqlite3-dev pkg-config cmake g++ libclang-dev dpkg-dev
+      # No Rust cache: nothing on `main` builds this release target, and a cache saved
+      # from a tag is visible to that tag alone.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - run: cargo build --release --locked --workspace
+      - run: cargo deb --no-build -p highwater
+      # cargo-deb only *warns* when dpkg-shlibdeps cannot run, and a package declaring no
+      # libraries installs happily and then fails to start. This turns that into a failure.
+      - name: The dependencies must come from the ELF
+        run: scripts/check-package-deps.sh target/debian/*.deb
+      - uses: actions/upload-artifact@v7
+        with:
+          name: deb
+          path: target/debian/*.deb
+          if-no-files-found: error
+
+  rpm:
+    # GitHub has no Fedora-hosted runner and does not plan one (actions/runner-images
+    # issue 2307). A Fedora container on an Ubuntu runner is the standard route; the only
+    # alternative is a self-hosted machine. This is the one place Docker appears.
+    #
+    # It is also a correctness requirement, not just a convenience: cargo-generate-rpm's
+    # auto-req scans the payload transitively, so the requires list is the build host's
+    # whole shared-library closure. Built anywhere but Fedora it names libraries Fedora
+    # numbers differently, and the package will not install.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    container: fedora:44
+    permissions:
+      contents: read
+    steps:
+      - name: Bootstrap the container
+        run: |
+          dnf install -y git gcc gcc-c++ cmake clang-devel fontconfig-devel \
+            sqlite-devel pkgconf-pkg-config rpm-build
+      - uses: actions/checkout@v7
+      - name: Install rustup
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # cargo-generate-rpm publishes no binaries, so it is compiled; see `deb` for why
+      # there is no Rust cache.
+      - run: cargo install cargo-generate-rpm --locked
+      - run: cargo build --release --locked --workspace
+      - run: cargo generate-rpm -p crates/highwater
+      - name: The dependencies must come from the ELF
+        run: scripts/check-package-deps.sh target/generate-rpm/*.rpm
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rpm
+          path: target/generate-rpm/*.rpm
+          if-no-files-found: error
+
+  # The setup is built and its isolated installer tests run by the same workflow `main`
+  # runs, starting from the cache `main` saved; with a version it uploads the setup.
+  windows:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/windows-installer.yml
+    with:
+      version: ${{ github.ref_name }}
+
+  # A draft, not a publication: a person decides when it goes out.
+  release:
+    needs: [version, checks, deb, rpm, windows]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    # The one job that writes: creating the draft release is the only mutation anywhere
+    # in this workflow, so the build jobs above stay read-only.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - run: ls -l artifacts
+      # The package tools name their outputs the way package managers expect — the -1 is
+      # the Debian revision, the suffix the architecture. The file a person downloads gets
+      # the project's own name instead, shaped by the tag the version job has already
+      # agreed with Cargo.toml. The Windows installer arrives already named that way,
+      # so there is nothing here to rename it from.
+      - name: Give the assets their release names
+        run: |
+          mv artifacts/*.deb "artifacts/Highwater-${GITHUB_REF_NAME}.deb"
+          mv artifacts/*.rpm "artifacts/Highwater-${GITHUB_REF_NAME}.rpm"
+      - uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          files: artifacts/*
+          fail_on_unmatched_files: true
