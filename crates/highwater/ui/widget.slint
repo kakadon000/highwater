@@ -184,6 +184,20 @@ export component WidgetWindow inherits Window {
         + max(WidgetDesk.rows.length, 1) * root.row-height
         + root.footer-height + root.pad - 4px;
 
+    // The size the window wants, as the row count stands right now. The winit
+    // backend sizes a window only when it shows it, and this one shows before
+    // the first readings land — so the client asks for these again whenever
+    // the rows change. Without them the card clips inside the frame it was
+    // created with, and every account added or removed after keeps the stale
+    // frame.
+    public pure function preferred-window-width() -> length {
+        return root.card-width + 2 * root.gutter;
+    }
+
+    public pure function preferred-window-height() -> length {
+        return root.card-height + 2 * root.gutter;
+    }
+
     card := Rectangle {
         x: root.gutter;
         y: root.gutter;
@@ -365,7 +379,7 @@ export component WidgetWindow inherits Window {
                     Text {
                         text: WidgetDesk.rows.length == 0 ? "nothing tracked"
                             : WidgetDesk.rows.length == 1 ? "1 provider"
-                            : "{WidgetDesk.rows.length} providers";
+                            : "\{WidgetDesk.rows.length} providers";
                         color: Theme.ink(0.45);
                         font-size: Theme.caption * 0.92 * WidgetDesk.scale;
                         font-weight: 600;

@@ -210,6 +210,17 @@ impl WidgetPanel {
         };
         ui.global::<WidgetDesk>().set_connected(connected);
         self.rows.set_vec(rows);
+        // The winit backend sizes a window only when it shows it, and this one
+        // shows before the first readings land: without resizing here the card
+        // clips inside the frame it was created with, and every account added
+        // or removed after keeps the stale frame. The card's own arithmetic
+        // comes back through the window's public functions, so this cannot
+        // drift from what the .slint lays out.
+        ui.window().set_size(slint::LogicalSize::new(
+            ui.invoke_preferred_window_width(),
+            ui.invoke_preferred_window_height(),
+        ));
+        self.place();
     }
 
     /// Copies the desktop's dark choice onto this window's own palette, as the
